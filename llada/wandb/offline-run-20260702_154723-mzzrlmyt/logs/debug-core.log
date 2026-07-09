@@ -1,0 +1,6 @@
+{"time":"2026-07-02T15:47:23.704091175+01:00","level":"INFO","msg":"main: starting server","port-filename":"/tmp/dcs-tmp.u5751903/tmp2j9wk8iu/port-579758.txt","pid":579758,"detached":false,"idle-timeout":600000000000,"log-level":0,"disable-analytics":false,"shutdown-on-parent-exit":false,"enable-dcgm-profiling":false}
+{"time":"2026-07-02T15:47:23.705593732+01:00","level":"INFO","msg":"server: will exit if parent process dies","ppid":579758}
+{"time":"2026-07-02T15:47:23.705623297+01:00","level":"INFO","msg":"server: accepting connections","addr":{"Name":"/tmp/dcs-tmp.u5751903/wandb-579758-579833-2753728581/socket","Net":"unix"}}
+{"time":"2026-07-02T15:47:23.794772798+01:00","level":"INFO","msg":"connection: ManageConnectionData: new connection created","id":"1(@)"}
+{"time":"2026-07-02T15:47:23.803512471+01:00","level":"INFO","msg":"handleInformInit: received","streamId":"mzzrlmyt","id":"1(@)"}
+{"time":"2026-07-02T15:47:23.921974231+01:00","level":"INFO","msg":"handleInformInit: stream started","streamId":"mzzrlmyt","id":"1(@)"}

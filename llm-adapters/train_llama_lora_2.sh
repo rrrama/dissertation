@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=1 python finetune.py \
+  --output_dir './trained_models/llama-lora-64' \
+  --base_model 'yahma/llama-7b-hf' \
+  --data_path './ft-training_set/math_10k.json' \
+  --output_dir './trained_models/llama-lora' \
+  --batch_size 16 \
+  --micro_batch_size 4 \
+  --num_epochs 3 \
+  --learning_rate 3e-4 \
+  --cutoff_len 256 \
+  --val_set_size 120 \
+  --lora_r 64 \
+  --adapter_name lorta

@@ -1,0 +1,2 @@
+python: can't open file '/dcs/pg25/u5751903/dev/lorta/train.py': [Errno 2] No such file or directory
+srun: error: gecko-02: task 0: Exited with exit code 2
