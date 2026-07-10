@@ -1,183 +1,0 @@
-Requirement already satisfied: wandb in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (0.28.0)
-Requirement already satisfied: click>=8.2.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (8.3.1)
-Requirement already satisfied: gitpython!=3.1.29,>=1.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (3.1.50)
-Requirement already satisfied: packaging in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (25.0)
-Requirement already satisfied: platformdirs in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (4.10.0)
-Requirement already satisfied: protobuf!=5.28.0,!=5.29.0,<8,>4.21.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (7.35.1)
-Requirement already satisfied: pydantic<3,>=2.6 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.13.4)
-Requirement already satisfied: pyyaml in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (6.0.3)
-Requirement already satisfied: requests<3,>=2.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.33.1)
-Requirement already satisfied: sentry-sdk>=2.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.64.0)
-Requirement already satisfied: typing-extensions<5,>=4.8 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (4.15.0)
-Requirement already satisfied: annotated-types>=0.6.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (0.7.0)
-Requirement already satisfied: pydantic-core==2.46.4 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (2.46.4)
-Requirement already satisfied: typing-inspection>=0.4.2 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (0.4.2)
-Requirement already satisfied: charset_normalizer<4,>=2 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (3.4.6)
-Requirement already satisfied: idna<4,>=2.5 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (3.11)
-Requirement already satisfied: urllib3<3,>=1.26 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (2.6.3)
-Requirement already satisfied: certifi>=2023.5.7 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (2026.2.25)
-Requirement already satisfied: gitdb<5,>=4.0.1 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from gitpython!=3.1.29,>=1.0.0->wandb) (4.0.12)
-Requirement already satisfied: smmap<6,>=3.0.1 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from gitdb<5,>=4.0.1->gitpython!=3.1.29,>=1.0.0->wandb) (5.0.3)
-Obtaining file:///dcs/pg25/u5751903/dev/lorta/peft
-  Installing build dependencies: started
-  Installing build dependencies: finished with status 'done'
-  Checking if build backend supports build_editable: started
-  Checking if build backend supports build_editable: finished with status 'done'
-  Getting requirements to build editable: started
-  Getting requirements to build editable: finished with status 'done'
-  Preparing editable metadata (pyproject.toml): started
-  Preparing editable metadata (pyproject.toml): finished with status 'done'
-Building wheels for collected packages: peft
-  Building editable for peft (pyproject.toml): started
-  Building editable for peft (pyproject.toml): finished with status 'done'
-  Created wheel for peft: filename=peft-0.10.1.dev0-0.editable-py3-none-any.whl size=7134 sha256=7dba5efcec5653b0681a86150eff3be59ec60ad654d72ba87f9db1c436021b30
-  Stored in directory: /tmp/dcs-tmp.u5751903/pip-ephem-wheel-cache-8bb147r1/wheels/8c/a8/10/f42cfa801766dca6edc5e81b8b2b69c2ab84c89f7df855315b
-Successfully built peft
-Installing collected packages: peft
-  Attempting uninstall: peft
-    Found existing installation: peft 0.10.1.dev0
-    Uninstalling peft-0.10.1.dev0:
-      Successfully uninstalled peft-0.10.1.dev0
-Successfully installed peft-0.10.1.dev0
-W0702 17:00:47.521000 586899 site-packages/torch/distributed/run.py:851] 
-W0702 17:00:47.521000 586899 site-packages/torch/distributed/run.py:851] *****************************************
-W0702 17:00:47.521000 586899 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-W0702 17:00:47.521000 586899 site-packages/torch/distributed/run.py:851] *****************************************
-Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]wandb: Tracking run with wandb version 0.28.0
-wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
-wandb: Run data is saved locally in /dcs/pg25/u5751903/dev/lorta/llada/wandb/offline-run-20260702_170056-vxktzpf6
-wandb: View this run in the terminal with `wandb leet`
-Loading checkpoint shards:  17%|█▋        | 1/6 [00:00<00:00,  5.82it/s]Loading checkpoint shards:  17%|█▋        | 1/6 [00:00<00:00,  5.66it/s]Loading checkpoint shards:  33%|███▎      | 2/6 [00:00<00:00,  5.88it/s]Loading checkpoint shards:  33%|███▎      | 2/6 [00:00<00:00,  5.67it/s]Loading checkpoint shards:  50%|█████     | 3/6 [00:00<00:00,  5.84it/s]Loading checkpoint shards:  50%|█████     | 3/6 [00:00<00:00,  5.73it/s]Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:00<00:00,  5.90it/s]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:00<00:00,  5.89it/s]Loading checkpoint shards:  83%|████████▎ | 5/6 [00:00<00:00,  5.93it/s]Loading checkpoint shards:  83%|████████▎ | 5/6 [00:00<00:00,  5.97it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  5.98it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  5.93it/s]
-Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  6.04it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  5.92it/s]
-base_model.model.lora_C_l: torch.Size([32, 128]) parameters
-base_model.model.lora_C_h: torch.Size([32, 128]) parameters
-base_model.model.lora_C_m: torch.Size([4, 128]) parameters
-base_model.model.lora_A: torch.Size([4096, 128]) parameters
-base_model.model.lora_B: torch.Size([128, 128]) parameters
-base_model.model.lora_C_l: torch.Size([32, 128]) parameters
-base_model.model.lora_C_h: torch.Size([32, 128]) parameters
-base_model.model.lora_C_m: torch.Size([4, 128]) parameters
-base_model.model.lora_A: torch.Size([4096, 128]) parameters
-base_model.model.lora_B: torch.Size([128, 128]) parameters
-Loading checkpoint shards:  17%|█▋        | 1/6 [00:00<00:02,  2.34it/s]Loading checkpoint shards:  33%|███▎      | 2/6 [00:00<00:01,  2.73it/s]WARNING:root:Downloading Data
-WARNING:root:Downloading Data
-Loading checkpoint shards:  50%|█████     | 3/6 [00:00<00:00,  3.69it/s]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:01<00:00,  4.42it/s]Loading checkpoint shards:  83%|████████▎ | 5/6 [00:01<00:00,  5.06it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  5.31it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:01<00:00,  4.34it/s]
-base_model.model.lora_C_l: torch.Size([32, 128]) parameters
-base_model.model.lora_C_h: torch.Size([32, 128]) parameters
-base_model.model.lora_C_m: torch.Size([4, 128]) parameters
-base_model.model.lora_A: torch.Size([4096, 128]) parameters
-base_model.model.lora_B: torch.Size([128, 128]) parameters
-WARNING:root:Downloading Data
-WARNING:root:Formatting inputs...
-WARNING:root:Formatting inputs...
-WARNING:root:Tokenizing inputs... This may take some time...
-WARNING:root:Tokenizing inputs... This may take some time...
-WARNING:root:Formatting inputs...
-WARNING:root:Tokenizing inputs... This may take some time...
-/dcs/pg25/u5751903/dev/lorta/llada/train.py:204: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `LladaSFTTrainer.__init__`. Use `processing_class` instead.
-  super().__init__(*args, **kwargs)
-/dcs/pg25/u5751903/dev/lorta/llada/train.py:204: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `LladaSFTTrainer.__init__`. Use `processing_class` instead.
-  super().__init__(*args, **kwargs)
-/dcs/pg25/u5751903/dev/lorta/llada/train.py:204: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `LladaSFTTrainer.__init__`. Use `processing_class` instead.
-  super().__init__(*args, **kwargs)
-No label_names provided for model class `PeftModelForCausalLM`. Since `PeftModel` hides base models input arguments, if label_names is not given, label_names can't be set automatically within `Trainer`. Note that empty label_names list will be used instead.
-No label_names provided for model class `PeftModelForCausalLM`. Since `PeftModel` hides base models input arguments, if label_names is not given, label_names can't be set automatically within `Trainer`. Note that empty label_names list will be used instead.
-[rank1]: Traceback (most recent call last):
-[rank1]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 396, in <module>
-[rank1]:     train()
-[rank1]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 364, in train
-[rank1]:     trainer.train()
-[rank1]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2241, in train
-[rank1]:     return inner_training_loop(
-[rank1]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2336, in _inner_training_loop
-[rank1]:     self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
-[rank1]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/modeling_utils.py", line 2588, in gradient_checkpointing_enable
-[rank1]:     raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
-[rank1]: ValueError: LLaDAModelLM does not support gradient checkpointing.
-[rank2]: Traceback (most recent call last):
-[rank2]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 396, in <module>
-[rank2]:     train()
-[rank2]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 364, in train
-[rank2]:     trainer.train()
-[rank2]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2241, in train
-[rank2]:     return inner_training_loop(
-[rank2]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2336, in _inner_training_loop
-[rank2]:     self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
-[rank2]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/modeling_utils.py", line 2588, in gradient_checkpointing_enable
-[rank2]:     raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
-[rank2]: ValueError: LLaDAModelLM does not support gradient checkpointing.
-No label_names provided for model class `PeftModelForCausalLM`. Since `PeftModel` hides base models input arguments, if label_names is not given, label_names can't be set automatically within `Trainer`. Note that empty label_names list will be used instead.
-Traceback (most recent call last):
-  File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 396, in <module>
-    train()
-  File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 364, in train
-    trainer.train()
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2241, in train
-    return inner_training_loop(
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2336, in _inner_training_loop
-    self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/modeling_utils.py", line 2588, in gradient_checkpointing_enable
-    raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
-ValueError: LLaDAModelLM does not support gradient checkpointing.
-[rank0]: Traceback (most recent call last):
-[rank0]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 396, in <module>
-[rank0]:     train()
-[rank0]:   File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 364, in train
-[rank0]:     trainer.train()
-[rank0]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2241, in train
-[rank0]:     return inner_training_loop(
-[rank0]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/trainer.py", line 2336, in _inner_training_loop
-[rank0]:     self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
-[rank0]:   File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/transformers/modeling_utils.py", line 2588, in gradient_checkpointing_enable
-[rank0]:     raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
-[rank0]: ValueError: LLaDAModelLM does not support gradient checkpointing.
-[1;34mwandb[0m: 
-[1;34mwandb[0m: You can sync this run to the cloud by running:
-[1;34mwandb[0m: [1mwandb sync /dcs/pg25/u5751903/dev/lorta/llada/wandb/offline-run-20260702_170056-vxktzpf6[0m
-[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20260702_170056-vxktzpf6/logs[0m
-W0702 17:01:09.313000 586899 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 586932 closing signal SIGTERM
-W0702 17:01:09.314000 586899 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 586934 closing signal SIGTERM
-E0702 17:01:09.579000 586899 site-packages/torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: 1) local_rank: 1 (pid: 586933) of binary: /dcs/pg25/u5751903/.conda/envs/llada/bin/python3.10
-Traceback (most recent call last):
-  File "/dcs/pg25/u5751903/.conda/envs/llada/bin/torchrun", line 6, in <module>
-    sys.exit(main())
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
-    return f(*args, **kwargs)
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/torch/distributed/run.py", line 990, in main
-    run(args)
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/torch/distributed/run.py", line 981, in run
-    elastic_launch(
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
-    return launch_agent(self._config, self._entrypoint, list(args))
-  File "/dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
-    raise ChildFailedError(
-torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
-============================================================
-train.py FAILED
-------------------------------------------------------------
-Failures:
-[1]:
-  time      : 2026-07-02_17:01:09
-  host      : gecko-02.dcs.warwick.ac.uk
-  rank      : 0 (local_rank: 0)
-  exitcode  : -15 (pid: 586932)
-  error_file: <N/A>
-  traceback : Signal 15 (SIGTERM) received by PID 586932
-[2]:
-  time      : 2026-07-02_17:01:09
-  host      : gecko-02.dcs.warwick.ac.uk
-  rank      : 2 (local_rank: 2)
-  exitcode  : 1 (pid: 586934)
-  error_file: <N/A>
-  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
-------------------------------------------------------------
-Root Cause (first observed failure):
-[0]:
-  time      : 2026-07-02_17:01:09
-  host      : gecko-02.dcs.warwick.ac.uk
-  rank      : 1 (local_rank: 1)
-  exitcode  : 1 (pid: 586933)
-  error_file: <N/A>
-  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
-============================================================
-srun: error: gecko-02: task 0: Exited with exit code 1

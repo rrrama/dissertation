@@ -1,61 +1,0 @@
-Requirement already satisfied: wandb in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (0.28.0)
-Requirement already satisfied: click>=8.2.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (8.3.1)
-Requirement already satisfied: gitpython!=3.1.29,>=1.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (3.1.50)
-Requirement already satisfied: packaging in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (25.0)
-Requirement already satisfied: platformdirs in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (4.10.0)
-Requirement already satisfied: protobuf!=5.28.0,!=5.29.0,<8,>4.21.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (7.35.1)
-Requirement already satisfied: pydantic<3,>=2.6 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.13.4)
-Requirement already satisfied: pyyaml in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (6.0.3)
-Requirement already satisfied: requests<3,>=2.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.33.1)
-Requirement already satisfied: sentry-sdk>=2.0.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (2.64.0)
-Requirement already satisfied: typing-extensions<5,>=4.8 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from wandb) (4.15.0)
-Requirement already satisfied: annotated-types>=0.6.0 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (0.7.0)
-Requirement already satisfied: pydantic-core==2.46.4 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (2.46.4)
-Requirement already satisfied: typing-inspection>=0.4.2 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from pydantic<3,>=2.6->wandb) (0.4.2)
-Requirement already satisfied: charset_normalizer<4,>=2 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (3.4.6)
-Requirement already satisfied: idna<4,>=2.5 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (3.11)
-Requirement already satisfied: urllib3<3,>=1.26 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (2.6.3)
-Requirement already satisfied: certifi>=2023.5.7 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from requests<3,>=2.0.0->wandb) (2026.2.25)
-Requirement already satisfied: gitdb<5,>=4.0.1 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from gitpython!=3.1.29,>=1.0.0->wandb) (4.0.12)
-Requirement already satisfied: smmap<6,>=3.0.1 in /dcs/pg25/u5751903/.conda/envs/llada/lib/python3.10/site-packages (from gitdb<5,>=4.0.1->gitpython!=3.1.29,>=1.0.0->wandb) (5.0.3)
-Obtaining file:///dcs/pg25/u5751903/dev/lorta/peft
-  Installing build dependencies: started
-  Installing build dependencies: finished with status 'done'
-  Checking if build backend supports build_editable: started
-  Checking if build backend supports build_editable: finished with status 'done'
-  Getting requirements to build editable: started
-  Getting requirements to build editable: finished with status 'done'
-  Preparing editable metadata (pyproject.toml): started
-  Preparing editable metadata (pyproject.toml): finished with status 'done'
-Building wheels for collected packages: peft
-  Building editable for peft (pyproject.toml): started
-  Building editable for peft (pyproject.toml): finished with status 'done'
-  Created wheel for peft: filename=peft-0.10.1.dev0-0.editable-py3-none-any.whl size=7134 sha256=6fde80393adb68c0509c17b6f9255ea2e5e4d0212b0475bec5fb6cc0aa4593c0
-  Stored in directory: /tmp/dcs-tmp.u5751903/pip-ephem-wheel-cache-7p1yp2ns/wheels/8c/a8/10/f42cfa801766dca6edc5e81b8b2b69c2ab84c89f7df855315b
-Successfully built peft
-Installing collected packages: peft
-  Attempting uninstall: peft
-    Found existing installation: peft 0.10.1.dev0
-    Uninstalling peft-0.10.1.dev0:
-      Successfully uninstalled peft-0.10.1.dev0
-Successfully installed peft-0.10.1.dev0
-wandb: Tracking run with wandb version 0.28.0
-wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
-wandb: Run data is saved locally in /dcs/pg25/u5751903/dev/lorta/llada/wandb/offline-run-20260702_154723-mzzrlmyt
-wandb: View this run in the terminal with `wandb leet`
-The model weights are not tied. Please use the `tie_weights` method before using the `infer_auto_device` function.
-Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]Loading checkpoint shards:  17%|█▋        | 1/6 [00:10<00:51, 10.27s/it]Loading checkpoint shards:  33%|███▎      | 2/6 [00:24<00:50, 12.52s/it]Loading checkpoint shards:  50%|█████     | 3/6 [00:38<00:39, 13.13s/it]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:52<00:27, 13.65s/it]Loading checkpoint shards:  83%|████████▎ | 5/6 [01:06<00:13, 13.69s/it]Loading checkpoint shards: 100%|██████████| 6/6 [01:16<00:00, 12.53s/it]Loading checkpoint shards: 100%|██████████| 6/6 [01:16<00:00, 12.78s/it]
-WARNING:root:Downloading Data
-WARNING:root:Formatting inputs...
-WARNING:root:Tokenizing inputs... This may take some time...
-/dcs/pg25/u5751903/dev/lorta/llada/train.py:204: FutureWarning: `tokenizer` is deprecated and will be removed in version 5.0.0 for `LladaSFTTrainer.__init__`. Use `processing_class` instead.
-  super().__init__(*args, **kwargs)
-No label_names provided for model class `PeftModelForCausalLM`. Since `PeftModel` hides base models input arguments, if label_names is not given, label_names can't be set automatically within `Trainer`. Note that empty label_names list will be used instead.
-base_model.model.lora_C_l: torch.Size([32, 128]) parameters
-base_model.model.lora_C_h: torch.Size([32, 128]) parameters
-base_model.model.lora_C_m: torch.Size([4, 128]) parameters
-base_model.model.lora_A: torch.Size([4096, 128]) parameters
-base_model.model.lora_B: torch.Size([128, 128]) parameters
-srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
-slurmstepd: error: *** JOB 1372066 ON gecko-02 CANCELLED AT 2026-07-02T16:53:12 ***
-  0%|          | 0/696 [00:00<?, ?it/s]  0%|          | 1/696 [06:28<74:58:08, 388.33s/it]  0%|          | 2/696 [12:14<70:06:32, 363.68s/it]  0%|          | 3/696 [18:31<71:10:16, 369.72s/it]  1%|          | 4/696 [24:38<70:53:15, 368.78s/it]  1%|          | 5/696 [30:55<71:21:00, 371.72s/it]  1%|          | 6/696 [37:01<70:52:33, 369.79s/it]  1%|          | 7/696 [43:28<71:48:57, 375.24s/it]  1%|          | 8/696 [49:28<70:47:40, 370.44s/it]  1%|▏         | 9/696 [55:42<70:53:59, 371.53s/it]  1%|▏         | 10/696 [1:02:05<71:26:41, 374.93s/it]                                                        1%|▏         | 10/696 [1:02:05<71:26:41, 374.93s/it]slurmstepd: error: *** STEP 1372066.0 ON gecko-02 CANCELLED AT 2026-07-02T16:53:12 ***

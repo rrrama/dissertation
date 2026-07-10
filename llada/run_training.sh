@@ -22,7 +22,7 @@ do
                 --num_train_epochs $epoch \
                 --per_device_train_batch_size 2 \
                 --gradient_accumulation_steps 10 \
-                --gradient_checkpointing True \
+                --gradient_checkpointing False \
                 --output_dir "outputs_llada_lorta_${rank}_${epoch}_${lr}" \
                 --expt_name "llada_gsm8k_training" \
                 --model_max_length 512 \

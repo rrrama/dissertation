@@ -1,5 +1,0 @@
-Traceback (most recent call last):
-  File "/dcs/pg25/u5751903/dev/lorta/llada/train.py", line 25, in <module>
-    import wandb
-ModuleNotFoundError: No module named 'wandb'
-srun: error: gecko-02: task 0: Exited with exit code 1
