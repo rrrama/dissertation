@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+.env
+
+# LLaDA experiment outputs
+llada/outputs/
+llada/outputs_*/
+llada/wandb/
+
+# Cluster job logs
+slurm_output
+smi_output
+slurm-*.out
+slurm-*.err
+*.sbatch.log
