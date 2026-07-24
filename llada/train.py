@@ -5,16 +5,19 @@
 #   - evaluation uses the iterative diffusion sampler in generate.py
 # See ../LLADA_CONVERSION_PLAN.md (items B4-B7).
 
+import argparse
+import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import Dict, Optional, Sequence
 
 import copy
 import torch
 import torch.nn.functional as F
 import transformers
+import yaml
 from torch.utils.data import Dataset
 from transformers import Trainer
 from tqdm import tqdm
@@ -319,11 +322,119 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     return accuracy, ans_pred_list, answers
 
 
-def train():
+# --------------------------------------------------------------------------- #
+# Config plumbing                                                              #
+# --------------------------------------------------------------------------- #
+#
+# `batch_train.py` freezes a fully-resolved, single-run config to `config.yaml`
+# in each run directory. That config is a flat dict that mixes fields for the
+# three dataclasses below with batch/slurm-only keys (`nproc_per_node`, `gres`,
+# `benchmark`, ...). We keep only the recognised dataclass fields, coerce their
+# types (YAML can leave e.g. "5e-2" as a string), and build the dataclasses.
+
+
+def _dataclass_field_names():
+    names = set()
+    for dc in (ModelArguments, DataArguments, TrainingArguments):
+        for f in dataclass_fields(dc):
+            names.add(f.name)
+    return names
+
+
+def _maybe_number(value):
+    """Coerce YAML strings that denote numbers (e.g. "5e-2") to int/float."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def build_args(config: Dict):
+    """Build (ModelArguments, DataArguments, TrainingArguments) from a dict."""
+    valid = _dataclass_field_names()
+    filtered = {k: _maybe_number(v) for k, v in config.items() if k in valid}
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments)
     )
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    return parser.parse_dict(filtered)
+
+
+def _build_peft_config(model_args):
+    """Return the adapter config for the selected `tuning_type`."""
+    # LLaDA target modules: q_proj / k_proj / v_proj / attn_out (no o_proj).
+    llada_target_modules = ["q_proj", "k_proj", "v_proj", "attn_out"]
+    if model_args.tuning_type == "lora":
+        from peft import LoraConfig
+
+        return LoraConfig(
+            task_type="CAUSAL_LM",
+            inference_mode=False,
+            r=model_args.rank,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=0.1,
+            target_modules=llada_target_modules,
+            init_lora_weights=True,
+        )
+    elif model_args.tuning_type == "lorta":
+        from peft import LorTaConfig
+
+        return LorTaConfig(
+            r=model_args.rank,
+            lora_alpha=model_args.lora_alpha,
+            target_modules=llada_target_modules,
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM",
+            init_lora_weights=True,
+        )
+    elif model_args.tuning_type == "nalorta":
+        from peft import NALorTaConfig
+
+        return NALorTaConfig(
+            r=model_args.rank,
+            lora_alpha=model_args.lora_alpha,
+            target_modules=llada_target_modules,
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM",
+            init_lora_weights=True,
+            embedding_length=32,
+        )
+    raise ValueError(f"Unknown tuning_type: {model_args.tuning_type}")
+
+
+def _load_tokenizer(model_args, training_args):
+    # LLaDA has its own vocabulary and a dedicated MASK token; do NOT add or
+    # resize special tokens (unlike the Llama GSM8K path).
+    return transformers.AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        token=model_args.token,
+        cache_dir=training_args.cache_dir,
+        model_max_length=training_args.model_max_length,
+        padding_side="right",
+        trust_remote_code=True,
+    )
+
+
+def run_training(config: Dict, output_dir: str):
+    """Train a single run whose hyperparameters come from `config`.
+
+    `output_dir` is assigned by the caller (batch_train.py); this function does
+    NOT construct its own nested output path.
+    """
+    from peft import get_peft_model
+
+    os.makedirs(output_dir, exist_ok=True)
+    config = dict(config)
+    config.setdefault("output_dir", output_dir)
+    model_args, data_args, training_args = build_args(config)
+    training_args.output_dir = output_dir
     is_main_process = training_args.process_index == 0
 
     if is_main_process:
@@ -355,74 +466,18 @@ def train():
         model.model.set_activation_checkpointing("whole_layer")
         training_args.gradient_checkpointing = False
 
-    # LLaDA target modules: q_proj / k_proj / v_proj / attn_out (no o_proj).
-    llada_target_modules = ["q_proj", "k_proj", "v_proj", "attn_out"]
-    if model_args.tuning_type == "lora":
-        from peft import LoraConfig, get_peft_model
-
-        config = LoraConfig(
-            task_type="CAUSAL_LM",
-            inference_mode=False,
-            r=model_args.rank,
-            lora_alpha=model_args.lora_alpha,
-            lora_dropout=0.1,
-            target_modules=llada_target_modules,
-            init_lora_weights=True,
-        )
-    elif model_args.tuning_type == "lorta":
-        from peft import LorTaConfig, get_peft_model
-
-        config = LorTaConfig(
-            r=model_args.rank,
-            lora_alpha=model_args.lora_alpha,
-            target_modules=llada_target_modules,
-            lora_dropout=0.1,
-            bias="none",
-            task_type="CAUSAL_LM",
-            init_lora_weights=True,
-        )
-    elif model_args.tuning_type == "nalorta":
-        from peft import NALorTaConfig, get_peft_model
-
-        config = NALorTaConfig(
-            r=model_args.rank,
-            lora_alpha=model_args.lora_alpha,
-            target_modules=llada_target_modules,
-            lora_dropout=0.1,
-            bias="none",
-            task_type="CAUSAL_LM",
-            init_lora_weights=True,
-            embedding_length=32,
-        )
-    else:
-        raise ValueError(f"Unknown tuning_type: {model_args.tuning_type}")
-
-    model = get_peft_model(model, config)
+    peft_config = _build_peft_config(model_args)
+    model = get_peft_model(model, peft_config)
 
     for name, param in model.named_parameters():
         if param.requires_grad:
             print(f"{name}: {param.shape} parameters")
 
-    # LLaDA has its own vocabulary and a dedicated MASK token; do NOT add or
-    # resize special tokens (unlike the Llama GSM8K path).
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        token=model_args.token,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        trust_remote_code=True,
-    )
+    tokenizer = _load_tokenizer(model_args, training_args)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    training_args.output_dir = os.path.join(
-        training_args.output_dir,
-        training_args.expt_name,
-        model_args.model_name_or_path.split("/")[-1],
-        f"ep_{int(training_args.num_train_epochs)}",
-        f"lr_{training_args.learning_rate}",
-        f"seed_{training_args.seed}",
-    )
+    # `output_dir` is assigned by batch_train.py; no nested path is constructed
+    # here (it was previously expt_name/model/ep_N/lr_X/seed_N).
 
     trainer = LladaSFTTrainer(
         model=model,
@@ -468,6 +523,126 @@ def train():
 
         wandb.finish()
 
+        # Also persist the training-time eval so `benchmark` mode is optional.
+        _write_benchmark_result(
+            output_dir,
+            {
+                "benchmark": "gsm8k_accuracy",
+                "accuracy": accuracy,
+                "num_examples": len(answers),
+                "predictions": ans_pred_list,
+                "ground_truth": answers,
+                "source": "train",
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Benchmark mode                                                              #
+# --------------------------------------------------------------------------- #
+#
+# `benchmark` mode loads the base model + a trained adapter from a run
+# directory and runs a registered benchmark against it. The registry seam
+# (`BENCHMARKS`) lets additional benchmarks be plugged in later; for now the
+# only entry reuses `diffusion_evaluate` (GSM8K accuracy).
+
+
+def _write_benchmark_result(output_dir: str, result: Dict):
+    path = os.path.join(output_dir, "benchmark.json")
+    with open(path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Wrote benchmark result -> {path}")
+
+
+def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
+    """Load base model + trained adapter and score GSM8K test accuracy."""
+    from peft import PeftModel
+
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
+        token=model_args.token,
+        trust_remote_code=True,
+    )
+    model = PeftModel.from_pretrained(model, adapter_dir)
+    if torch.cuda.is_available():
+        model = model.to("cuda")
+    model.eval()
+
+    tokenizer = _load_tokenizer(model_args, training_args)
+    logging.warning("Downloading Data")
+    test_set = load_dataset(data_args.data_name, "main", split="test")
+
+    accuracy, ans_pred_list, answers = diffusion_evaluate(
+        model, tokenizer, test_set, training_args
+    )
+    print(f"adapter: {adapter_dir} | GSM8K test accuracy: {100*accuracy:.2f}%")
+    return {
+        "benchmark": "gsm8k_accuracy",
+        "accuracy": accuracy,
+        "num_examples": len(answers),
+        "predictions": ans_pred_list,
+        "ground_truth": answers,
+        "source": "benchmark",
+    }
+
+
+# Registry seam: name -> callable(model_args, data_args, training_args, adapter_dir).
+BENCHMARKS = {
+    "gsm8k_accuracy": _gsm8k_accuracy_benchmark,
+}
+
+
+def run_benchmark(config: Dict, output_dir: str):
+    """Run the configured benchmark against the trained adapter in `output_dir`."""
+    config = dict(config)
+    config.setdefault("output_dir", output_dir)
+    bench_name = config.get("benchmark", "gsm8k_accuracy")
+    if bench_name not in BENCHMARKS:
+        raise ValueError(
+            f"Unknown benchmark '{bench_name}'. Registered: {sorted(BENCHMARKS)}"
+        )
+
+    adapter_config = os.path.join(output_dir, "adapter_config.json")
+    if not os.path.exists(adapter_config):
+        raise FileNotFoundError(
+            f"No trained adapter found in {output_dir} (missing adapter_config.json). "
+            "Train this run before benchmarking."
+        )
+
+    model_args, data_args, training_args = build_args(config)
+    training_args.output_dir = output_dir
+    result = BENCHMARKS[bench_name](model_args, data_args, training_args, output_dir)
+    _write_benchmark_result(output_dir, result)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train or benchmark a single LoRTA run from a frozen config.yaml."
+    )
+    parser.add_argument(
+        "--config", required=True, help="Path to a frozen per-run config.yaml."
+    )
+    parser.add_argument("--mode", choices=["train", "benchmark"], default="train")
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+        help="Run output directory. Defaults to the directory holding --config.",
+    )
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f) or {}
+
+    output_dir = args.output_dir or os.path.dirname(os.path.abspath(args.config))
+
+    if args.mode == "train":
+        run_training(config, output_dir)
+    else:
+        run_benchmark(config, output_dir)
+
 
 if __name__ == "__main__":
-    train()
+    main()

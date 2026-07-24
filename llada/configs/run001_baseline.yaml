@@ -1,0 +1,49 @@
+# Baseline LoRTA run on GSM8K with LLaDA-8B-Instruct.
+# Any list-valued field would expand into a cartesian product of runs; this
+# config has none, so it is a single run.
+
+# --- model / adapter ---
+model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+tuning_type: "lorta"          # lora | lorta | nalorta
+rank: 128
+lora_alpha: 4
+
+# --- data ---
+data_name: "gsm8k"
+
+# --- optimisation ---
+learning_rate: 0.05
+num_train_epochs: 6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 10
+gradient_checkpointing: false
+warmup_ratio: 0.03
+lr_scheduler_type: "cosine"
+seed: 42
+model_max_length: 512
+
+# --- logging / checkpointing ---
+expt_name: "llada_gsm8k_training"
+wandb_project: "llada_gsm8k_training"
+report_to: "wandb"
+logging_strategy: "steps"
+logging_steps: 10
+save_strategy: "steps"
+save_steps: 100
+eval_steps: 100
+
+# --- LLaDA diffusion (train + sampler) ---
+mask_id: 126336
+diffusion_eps: 0.001
+gen_length: 256
+diffusion_steps: 256
+block_length: 256
+remasking: "low_confidence"
+gen_temperature: 0.0
+
+# --- batch / slurm meta (consumed by batch_train.py, ignored by train.py) ---
+nproc_per_node: 3
+gres: "gpu:lovelace_l40:3"
+
+# --- benchmark ---
+benchmark: "gsm8k_accuracy"
