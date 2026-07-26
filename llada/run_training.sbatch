@@ -16,6 +16,11 @@ export WANDB_MODE=offline
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 pip install wandb
-pip install -e $SHARE/u5751903/lorta/peft --no-deps
+
+# Install the peft fork from THIS checkout, not a sibling clone, so the tuners
+# (lorta/nalorta) match the train.py being run.
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
+pip install -e "$REPO_ROOT/peft" --no-deps || exit 1
+python -c "from peft import LorTaConfig, NALorTaConfig; import peft; print('peft from', peft.__file__)" || exit 1
 
 srun bash llada/run_training.sh

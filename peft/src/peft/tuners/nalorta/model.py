@@ -58,7 +58,7 @@ def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
     return args, kwargs
 
 
-class NANALorTaModel(BaseTuner):
+class NALorTaModel(BaseTuner):
     """
     Creates Low Rank Tensor Adapter (NALoRTA) model from a pretrained transformers model.
 
@@ -388,9 +388,7 @@ class NANALorTaModel(BaseTuner):
                 f"(got {peft_config.embedding_length})."
             )
         self.eta = peft_config.eta
-        self.model.lora_phi = GaussianFourierProjection(
-            embedding_size=peft_config.embedding_length // 2, log=False
-        )
+        self.model.lora_phi = GaussianFourierProjection(embedding_size=peft_config.embedding_length // 2, log=False)
 
         self.model.lora_A = nn.Parameter(torch.empty(A_shape))
         self.model.lora_B = nn.Parameter(torch.zeros(B_shape))

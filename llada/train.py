@@ -2,7 +2,8 @@
 # *diffusion* language model. The autoregressive next-token CE loss and the
 # `.generate()` eval of the GSM8K harness do NOT apply here; both are replaced:
 #   - training uses the LLaDA masked-diffusion SFT objective (see LladaSFTTrainer)
-#   - evaluation uses the iterative diffusion sampler in generate.py
+#   - evaluation uses the iterative diffusion sampler in generate.py, and runs
+#     only in `--mode benchmark` (never inside the training loop)
 # See ../LLADA_CONVERSION_PLAN.md (items B4-B7).
 
 import argparse
@@ -491,50 +492,11 @@ def run_training(config: Dict, output_dir: str):
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
-    # Diffusion sampling is single-GPU and not batched across ranks; only run
-    # it (and log to wandb) once, on the main process.
+    # No evaluation here: diffusion sampling is expensive and single-GPU, so it
+    # is a separate job (`--mode benchmark`) run against the saved adapter.
     if is_main_process:
-        model = trainer.model.eval()
-
-        ######################
-        #     evaluation     #
-        ######################
-        logging.warning("Downloading Data")
-        test_set = load_dataset(data_args.data_name, "main", split="test")
-
-        accuracy, ans_pred_list, answers = diffusion_evaluate(
-            model, tokenizer, test_set, training_args
-        )
-
-        print("prediction", ans_pred_list)
-        print("ground truth", answers)
-
-        wandb.log(
-            {
-                "accuracy": accuracy,
-                "predictions": ans_pred_list,
-                "ground_truth": answers,
-            }
-        )
-
-        print(
-            f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*accuracy:.2f}%"
-        )
-
+        print(f"Training finished; adapter saved to {training_args.output_dir}")
         wandb.finish()
-
-        # Also persist the training-time eval so `benchmark` mode is optional.
-        _write_benchmark_result(
-            output_dir,
-            {
-                "benchmark": "gsm8k_accuracy",
-                "accuracy": accuracy,
-                "num_examples": len(answers),
-                "predictions": ans_pred_list,
-                "ground_truth": answers,
-                "source": "train",
-            },
-        )
 
 
 # --------------------------------------------------------------------------- #

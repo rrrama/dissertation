@@ -16,6 +16,10 @@ point in the product this script:
 Each per-run job runs ``torchrun train.py --config <frozen config.yaml>``
 (train mode) or ``python train.py --mode benchmark ...`` (benchmark mode).
 
+Re-running a config in train mode is safe: runs that already have a saved
+adapter are skipped, so only the missing points of a sweep are submitted. Pass
+``--overwrite`` to retrain (and clobber) finished runs.
+
 Usage:
     python batch_train.py --mode train     --config configs/run001_baseline.yaml
     python batch_train.py --mode benchmark  --config configs/run001_baseline.yaml
@@ -281,6 +285,11 @@ def submit(sbatch_path, no_submit):
 # --------------------------------------------------------------------------- #
 
 
+def _is_trained(run_dir):
+    """A run counts as trained once train.py has saved an adapter into it."""
+    return os.path.exists(os.path.join(run_dir, "adapter_config.json"))
+
+
 def _prepare_run_dir(exp_dir, name):
     run_dir = os.path.join(exp_dir, name)
     log_dir = os.path.join(run_dir, "logs")
@@ -331,7 +340,7 @@ def write_summary(exp_dir, runs_info, mode):
     print(f"Wrote {summary_path}")
 
 
-def run_train_mode(config, config_name, no_submit):
+def run_train_mode(config, config_name, no_submit, overwrite):
     runs = expand_runs(config)
     names = _unique_names(runs)
     exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
@@ -339,7 +348,16 @@ def run_train_mode(config, config_name, no_submit):
 
     print(f"Expanded to {len(runs)} run(s) under {exp_dir}")
     runs_info = []
+    skipped = []
     for idx, ((run_cfg, varying), name) in enumerate(zip(runs, names)):
+        run_dir = os.path.join(exp_dir, name)
+        # A finished run leaves an adapter behind. Re-submitting would clobber
+        # it (train.py saves into the same dir), so skip unless asked not to.
+        if _is_trained(run_dir) and not overwrite:
+            skipped.append(name)
+            runs_info.append({"name": name, "run_dir": run_dir, "varying": varying})
+            continue
+
         run_dir, log_dir = _prepare_run_dir(exp_dir, name)
         config_path = _freeze_config(run_cfg, run_dir)
         with open(os.path.join(run_dir, "metadata.json"), "w") as f:
@@ -351,6 +369,12 @@ def run_train_mode(config, config_name, no_submit):
         )
         submit(sbatch_path, no_submit)
         runs_info.append({"name": name, "run_dir": run_dir, "varying": varying})
+
+    if skipped:
+        print(
+            f"[skip] {len(skipped)}/{len(runs)} run(s) already trained; pass "
+            f"--overwrite to retrain them: {', '.join(skipped)}"
+        )
 
     write_summary(exp_dir, runs_info, "train")
 
@@ -365,7 +389,7 @@ def run_benchmark_mode(config, config_name, no_submit):
     missing = []
     for (run_cfg, varying), name in zip(runs, names):
         run_dir = os.path.join(exp_dir, name)
-        trained = os.path.exists(os.path.join(run_dir, "adapter_config.json"))
+        trained = _is_trained(run_dir)
         if not trained:
             missing.append(name)
         runs_info.append(
@@ -417,6 +441,15 @@ def main():
         action="store_true",
         help="Generate run dirs / sbatch scripts but do not call sbatch.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Retrain runs that already have a saved adapter, overwriting them. "
+            "By default such runs are skipped, so re-running a config resumes "
+            "an incomplete sweep instead of clobbering finished LoRTAs."
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -424,7 +457,7 @@ def main():
     config_name = os.path.splitext(os.path.basename(args.config))[0]
 
     if args.mode == "train":
-        run_train_mode(config, config_name, args.no_submit)
+        run_train_mode(config, config_name, args.no_submit, args.overwrite)
     else:
         run_benchmark_mode(config, config_name, args.no_submit)
 
