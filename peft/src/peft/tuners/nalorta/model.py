@@ -24,7 +24,6 @@ from itertools import chain
 from typing import Literal, Optional
 
 import torch
-from diffusers.models.embeddings import GaussianFourierProjection
 from torch import nn
 
 from peft.import_utils import is_bnb_4bit_available, is_bnb_available
@@ -46,6 +45,7 @@ from peft.utils import (
 from .aqlm import dispatch_aqlm
 from .awq import dispatch_awq
 from .config import NALorTaConfig
+from .embedding import GaussianFourierProjection
 from .gptq import dispatch_gptq
 from .layer import Linear as NALorTaLinear
 from .layer import NALorTaLayer, dispatch_default

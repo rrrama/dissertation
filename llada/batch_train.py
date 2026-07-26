@@ -88,11 +88,8 @@ export HF_HOME=$SHARE/u5751903/models/
 export WANDB_MODE=offline
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# `diffusers` is not a runtime dep of upstream peft (it only appears in the
-# `test` extra), but peft.tuners.nalorta imports GaussianFourierProjection from
-# it, so `import peft` fails without it. Installed explicitly because the peft
-# install below is --no-deps.
-pip install wandb pyyaml diffusers
+# Installed explicitly because the peft install below is --no-deps.
+pip install wandb pyyaml
 pip install -e {peft_dir} --no-deps
 
 cd {llada_dir}

@@ -15,9 +15,8 @@ export HF_HOME=$SHARE/u5751903/models/
 export WANDB_MODE=offline
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# `diffusers` is needed by peft.tuners.nalorta (GaussianFourierProjection) but
-# is not a runtime dep of peft itself, and the peft install below is --no-deps.
-pip install wandb diffusers
+# Installed explicitly because the peft install below is --no-deps.
+pip install wandb
 
 # Install the peft fork from THIS checkout, not a sibling clone, so the tuners
 # (lorta/nalorta) match the train.py being run.
