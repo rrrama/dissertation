@@ -40,6 +40,8 @@ from datetime import datetime, timezone
 import yaml
 
 LLADA_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = os.path.dirname(LLADA_DIR)
+PEFT_DIR = os.path.join(REPO_DIR, "peft")
 OUTPUTS_ROOT = os.path.join(LLADA_DIR, "outputs")
 
 # Keys that configure the batch/slurm layer rather than the training run. They
@@ -87,7 +89,7 @@ export WANDB_MODE=offline
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 pip install wandb pyyaml
-pip install -e $SHARE/u5751903/lorta/peft --no-deps
+pip install -e {peft_dir} --no-deps
 
 cd {llada_dir}
 srun {run_cmd}
@@ -254,6 +256,7 @@ def write_sbatch(mode, run_cfg, config_name, name, config_path, run_dir, log_dir
         sbatch_mem=slurm["sbatch_mem"],
         log_dir=log_dir,
         llada_dir=LLADA_DIR,
+        peft_dir=PEFT_DIR,
         run_cmd=_run_command(mode, config_path, run_dir, slurm),
     )
     sbatch_path = os.path.join(run_dir, f"job_{mode}.sbatch")
