@@ -35,6 +35,9 @@ diffusion_steps: 256
 block_length: 256
 remasking: "low_confidence"
 gen_temperature: 0.0
+# questions decoded simultaneously per rank in benchmark mode (1 = the old
+# one-at-a-time path); memory-bound, see BENCHMARK_PERF.md §4
+benchmark_batch_size: 8
 
 nproc_per_node: 3
 gres: "gpu:lovelace_l40:3"

@@ -113,6 +113,15 @@ class TrainingArguments(transformers.TrainingArguments):
     gen_temperature: float = field(
         default=0.0, metadata={"help": "Gumbel sampling temperature (0 = greedy)."}
     )
+    benchmark_batch_size: int = field(
+        default=8,
+        metadata={
+            "help": "Questions decoded simultaneously per rank in benchmark mode. "
+            "A single 320-token forward badly underuses an L40; memory is the "
+            "limit (the (B, S, vocab) logits dominate). 1 reproduces the old "
+            "one-question-at-a-time path exactly."
+        },
+    )
 
 
 def _tokenize_fn(
@@ -298,15 +307,91 @@ def _gather_predictions(local_indices, local_preds, total, world_size):
     return preds
 
 
+def _pad_token_id(tokenizer):
+    """A token id to left-pad prompts with. Must not be the MASK id."""
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None or pad_id == MASK_ID:
+        raise ValueError(
+            f"tokenizer has no usable pad token for batched decoding (got {pad_id})"
+        )
+    return pad_id
+
+
+def _stack_prompts(prompt_ids, pad_id, device):
+    """Stack 1-D prompt id tensors into (B, len) ids + an attention mask.
+
+    Equal-length prompts (what `_uniform_length_batches` produces) need no
+    padding and get `attention_mask=None`, which is not just tidier: LLaDA's
+    `modeling_llada.py` tests `0.0 in attention_mask` on every forward, and that
+    membership test is a device sync -- 256 of them per question.
+
+    Ragged input is still supported, and is padded on the *left*: the sampler
+    shares one block boundary across the batch, so every row's response region
+    has to start at the same offset. Note that ragged batches are not
+    output-preserving under NA-LoRTA; see `_uniform_length_batches`.
+    """
+    lengths = {ids.shape[0] for ids in prompt_ids}
+    if len(lengths) == 1:
+        return torch.stack(prompt_ids).to(device), None
+
+    max_len = max(lengths)
+    batch = torch.full((len(prompt_ids), max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(prompt_ids), max_len), dtype=torch.long)
+    for row, ids in enumerate(prompt_ids):
+        batch[row, max_len - ids.shape[0] :] = ids
+        attention_mask[row, max_len - ids.shape[0] :] = 1
+    return batch.to(device), attention_mask.to(device)
+
+
+def _uniform_length_batches(local_indices, prompt_ids, batch_size):
+    """Group a rank's questions into batches whose prompts are all the same length.
+
+    Batching only questions of identical prompt length keeps decoding exactly
+    output-preserving, which batching by *similar* length would not be. NA-LoRTA
+    modulates its adapter weights by the proportion of the input that is MASK
+    (`peft/src/peft/tuners/nalorta/model.py:193`), and that proportion is a single
+    scalar pooled over the whole batch. At any given sampling step every row has
+    the same *count* of masked tokens (they share the transfer schedule), so the
+    proportion differs across rows only through the denominator -- i.e. the prompt
+    length. Equal lengths make the pooled scalar identical to the per-row value,
+    so every question sees the same adapter weights it would at batch size 1.
+
+    It also means zero padding, and padding is pure waste: a padded position
+    still costs a full forward at each of the 256 steps.
+
+    The price is that batches are capped by how many questions happen to share a
+    length, so they are variable-sized and often smaller than `batch_size`.
+    """
+    by_length = {}
+    for i in local_indices:
+        by_length.setdefault(prompt_ids[i].shape[0], []).append(i)
+
+    batches = []
+    for length in sorted(by_length):
+        group = by_length[length]
+        batches += [group[k : k + batch_size] for k in range(0, len(group), batch_size)]
+    return batches
+
+
 @torch.no_grad()
 def diffusion_evaluate(model, tokenizer, test_set, training_args):
-    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler (one Q at a time).
+    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler.
 
-    Sampling is sequential and single-question, so the only parallelism available
-    is over the test set: under torchrun each rank samples an interleaved shard of
-    the questions on its own GPU and the predictions are gathered back into test-set
-    order before scoring. This is exact -- every question is decoded exactly as it
-    would be on one GPU, it just takes 1/world_size of the wall clock.
+    Two levels of parallelism, both over the test set (the 256 sampling steps
+    themselves are inherently sequential):
+
+      - across ranks: under torchrun each rank samples an interleaved shard of the
+        questions on its own GPU, and the predictions are gathered back into
+        test-set order before scoring;
+      - within a rank: up to `benchmark_batch_size` questions are decoded in one
+        batch, which is where most of the speedup is -- a batch-1 320-token
+        forward leaves an L40 mostly idle.
+
+    Both are exact: every question is decoded exactly as it would be alone on one
+    GPU. Batches are restricted to questions of identical prompt length to keep
+    that true under NA-LoRTA -- see `_uniform_length_batches`.
     """
     model.eval()
 
@@ -326,19 +411,35 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     # of them straggles at the end.
     local_indices = list(range(rank, len(questions), world_size))
 
-    local_preds = []
-    for i in tqdm(
-        local_indices,
+    prompt_ids = {
+        i: tokenizer(questions[i], return_tensors="pt")["input_ids"][0]
+        for i in local_indices
+    }
+    pad_id = _pad_token_id(tokenizer)
+    batch_size = max(1, int(training_args.benchmark_batch_size))
+    batches = _uniform_length_batches(local_indices, prompt_ids, batch_size)
+    if rank == 0:
+        mean_batch = len(local_indices) / max(1, len(batches))
+        print(
+            f"[rank {rank}] {len(local_indices)} questions -> {len(batches)} batches "
+            f"(cap {batch_size}, mean {mean_batch:.1f}); batches hold equal-length "
+            f"prompts only, so decoding is exact"
+        )
+
+    preds_by_index = {}
+    progress = tqdm(
         total=len(local_indices),
         desc=f"Evaluating (diffusion) [rank {rank}]",
         disable=rank != 0,
-    ):
-        input_ids = tokenizer(questions[i], return_tensors="pt")["input_ids"].to(
-            model.device
+    )
+    for batch_indices in batches:
+        input_ids, attention_mask = _stack_prompts(
+            [prompt_ids[i] for i in batch_indices], pad_id, model.device
         )
         out = generate(
             model,
             input_ids,
+            attention_mask=attention_mask,
             steps=training_args.diffusion_steps,
             gen_length=training_args.gen_length,
             block_length=training_args.block_length,
@@ -346,12 +447,18 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
             remasking=training_args.remasking,
             mask_id=training_args.mask_id,
         )
+        # left padding means the response region starts at the same offset in
+        # every row of the batch
         gen_tokens = out[:, input_ids.shape[1] :]
-        decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
-        if rank == 0:
-            print(decoded)
-        local_preds.append(extract_answer_number(decoded))
+        decoded_batch = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+        for i, decoded in zip(batch_indices, decoded_batch):
+            if rank == 0:
+                print(decoded)
+            preds_by_index[i] = extract_answer_number(decoded)
+        progress.update(len(batch_indices))
+    progress.close()
 
+    local_preds = [preds_by_index[i] for i in local_indices]
     ans_pred_list = _gather_predictions(
         local_indices, local_preds, len(questions), world_size
     )
