@@ -282,9 +282,32 @@ class LladaSFTTrainer(Trainer):
         return (loss, logits) if return_outputs else loss
 
 
+def _gather_predictions(local_indices, local_preds, total, world_size):
+    """Re-assemble the full, in-order prediction list from every rank's shard."""
+    preds = [float("inf")] * total
+    if world_size <= 1 or not torch.distributed.is_initialized():
+        for i, pred in zip(local_indices, local_preds):
+            preds[i] = pred
+        return preds
+
+    gathered = [None] * world_size
+    torch.distributed.all_gather_object(gathered, (local_indices, local_preds))
+    for indices, values in gathered:
+        for i, pred in zip(indices, values):
+            preds[i] = pred
+    return preds
+
+
 @torch.no_grad()
 def diffusion_evaluate(model, tokenizer, test_set, training_args):
-    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler (one Q at a time)."""
+    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler (one Q at a time).
+
+    Sampling is sequential and single-question, so the only parallelism available
+    is over the test set: under torchrun each rank samples an interleaved shard of
+    the questions on its own GPU and the predictions are gathered back into test-set
+    order before scoring. This is exact -- every question is decoded exactly as it
+    would be on one GPU, it just takes 1/world_size of the wall clock.
+    """
     model.eval()
 
     questions = [f"{example['question']}{QUESTION_PROMPT}" for example in test_set]
@@ -297,11 +320,20 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
             ans = float("inf")
         answers.append(ans)
 
-    ans_pred_list = []
-    for question in tqdm(
-        questions, total=len(questions), desc="Evaluating (diffusion)"
+    world_size, rank = training_args.world_size, training_args.process_index
+    # Interleaved (strided) shard rather than contiguous chunks: question cost
+    # varies with prompt length, and striding keeps the ranks balanced so none
+    # of them straggles at the end.
+    local_indices = list(range(rank, len(questions), world_size))
+
+    local_preds = []
+    for i in tqdm(
+        local_indices,
+        total=len(local_indices),
+        desc=f"Evaluating (diffusion) [rank {rank}]",
+        disable=rank != 0,
     ):
-        input_ids = tokenizer(question, return_tensors="pt")["input_ids"].to(
+        input_ids = tokenizer(questions[i], return_tensors="pt")["input_ids"].to(
             model.device
         )
         out = generate(
@@ -316,9 +348,13 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
         )
         gen_tokens = out[:, input_ids.shape[1] :]
         decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
-        print(decoded)
-        ans_pred_list.append(extract_answer_number(decoded))
+        if rank == 0:
+            print(decoded)
+        local_preds.append(extract_answer_number(decoded))
 
+    ans_pred_list = _gather_predictions(
+        local_indices, local_preds, len(questions), world_size
+    )
     accuracy = compute_accuracy(answers, ans_pred_list)
     return accuracy, ans_pred_list, answers
 
@@ -528,8 +564,10 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(model, adapter_dir)
-    if torch.cuda.is_available():
-        model = model.to("cuda")
+    # `training_args.device` is this rank's own GPU (cuda:LOCAL_RANK under
+    # torchrun); "cuda" would pile every rank onto cuda:0. No DDP wrapper: this
+    # is pure inference, the ranks only talk to each other at the final gather.
+    model = model.to(training_args.device)
     model.eval()
 
     tokenizer = _load_tokenizer(model_args, training_args)
@@ -576,7 +614,9 @@ def run_benchmark(config: Dict, output_dir: str):
     model_args, data_args, training_args = build_args(config)
     training_args.output_dir = output_dir
     result = BENCHMARKS[bench_name](model_args, data_args, training_args, output_dir)
-    _write_benchmark_result(output_dir, result)
+    # Every rank holds the same gathered result; only one of them writes it.
+    if training_args.process_index == 0:
+        _write_benchmark_result(output_dir, result)
     return result
 
 

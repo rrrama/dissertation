@@ -200,29 +200,15 @@ def build_metadata(run_cfg, varying):
 # --------------------------------------------------------------------------- #
 
 
-def _set_gpu_count(gres, count):
-    """Return `gres` with its trailing GPU count replaced by `count`.
-
-    Preserves the GPU type, e.g. ``gpu:lovelace_l40:3`` -> ``gpu:lovelace_l40:1``.
-    """
-    parts = gres.split(":")
-    if parts and parts[-1].isdigit():
-        parts[-1] = str(count)
-        return ":".join(parts)
-    return gres
-
-
 def _slurm_settings(run_cfg, mode):
     """Resolve slurm/GPU settings from the config, with plan defaults."""
     nproc = int(run_cfg.get("nproc_per_node", 3))
     gres = run_cfg.get("gres")
     if gres is None:
         gres = f"gpu:lovelace_l40:{nproc}"
-    # Benchmark (diffusion sampling) is single-GPU; do not reserve the full set,
-    # but keep the configured GPU type by only shrinking the count.
-    if mode == "benchmark":
-        nproc = 1
-        gres = _set_gpu_count(gres, 1)
+    # Benchmark sampling cannot be split within a question, but it is embarrassingly
+    # parallel *across* questions: each rank samples its own shard of the GSM8K test
+    # set (see diffusion_evaluate), so benchmarks use the same GPU count as training.
     return {
         "nproc_per_node": nproc,
         "gres": gres,
@@ -234,14 +220,10 @@ def _slurm_settings(run_cfg, mode):
 
 
 def _run_command(mode, config_path, run_dir, slurm):
-    if mode == "train":
-        return (
-            f"torchrun --standalone --nproc_per_node={slurm['nproc_per_node']} "
-            f"train.py --config {config_path} --output_dir {run_dir}"
-        )
+    mode_flag = "" if mode == "train" else "--mode benchmark "
     return (
-        f"python train.py --mode benchmark "
-        f"--config {config_path} --output_dir {run_dir}"
+        f"torchrun --standalone --nproc_per_node={slurm['nproc_per_node']} "
+        f"train.py {mode_flag}--config {config_path} --output_dir {run_dir}"
     )
 
 
