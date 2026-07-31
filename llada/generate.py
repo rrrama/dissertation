@@ -61,6 +61,45 @@ def get_num_transfer_tokens(mask_index, steps):
     return num_transfer_tokens
 
 
+# Peak extra memory allowed for the confidence softmax below, as a budget rather
+# than a row count so it adapts to the vocabulary size. 256 MB is small beside the
+# ~16 GB of bf16 weights and the (B, S, V) logits the forward already holds, and
+# large enough that the chunk loop is a handful of iterations, not hundreds.
+_CONFIDENCE_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _selected_token_prob(logits, x0):
+    """softmax(logits)[x0] -- the probability of the token actually chosen.
+
+    Only ever used to *rank* candidate positions in the topk below, so fp32 is
+    ample. The reference does this in fp64, which materialises a (B, S, V) fp64
+    tensor -- ~5 GB at B=16 -- and runs tens of millions of exp() on a GPU with no
+    fp64 transcendentals.
+
+    fp32 alone is not enough, though: a full-tensor `log_softmax(dtype=float32)`
+    still allocates (B, S, V) fp32 (~2.6 GB at B=16, S=320) purely to read one
+    element per row back out of it, and that allocation, not the weights, is what
+    caps `benchmark_batch_size`. Softmax rows are independent, so the same result
+    comes from slicing the rows into chunks and keeping only the gathered (B, S)
+    column -- identical arithmetic per row, bounded peak memory.
+    """
+    b, s, vocab = logits.shape
+    out = torch.empty((b, s), dtype=torch.float32, device=logits.device)
+
+    # chunk over sequence positions, taking every batch row: slicing dim 1 keeps
+    # the vocabulary axis contiguous, so the softmax fast path still applies and
+    # no (B, S, V)-sized copy is ever made.
+    positions = max(1, _CONFIDENCE_CHUNK_BYTES // (b * vocab * 4))
+    for start in range(0, s, positions):
+        stop = start + positions
+        log_p = F.log_softmax(logits[:, start:stop], dim=-1, dtype=torch.float32)
+        out[:, start:stop] = log_p.gather(
+            -1, x0[:, start:stop].unsqueeze(-1)
+        ).squeeze(-1)
+
+    return out.exp_()
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -173,17 +212,7 @@ def generate(
             x0 = torch.argmax(logits_with_noise, dim=-1)
 
             if remasking == "low_confidence":
-                # Confidence is only ever used to *rank* candidates in the topk
-                # below, so fp32 is ample. The reference does this softmax in
-                # fp64, which materialises a (B, S, V) fp64 tensor -- ~5 GB at
-                # B=16 -- and runs tens of millions of fp64 exp() on a GPU that
-                # has no fp64 transcendentals. log_softmax(dtype=float32) upcasts
-                # inside the kernel, so no fp32 copy of the logits is needed.
-                log_p = F.log_softmax(logits, dim=-1, dtype=torch.float32)
-                x0_p = torch.squeeze(
-                    torch.gather(log_p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
-                ).exp()
-                del log_p
+                x0_p = _selected_token_prob(logits, x0)
             elif remasking == "random":
                 x0_p = torch.rand(
                     (x0.shape[0], x0.shape[1]), device=x0.device, dtype=torch.float32

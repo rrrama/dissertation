@@ -204,17 +204,25 @@ class DataCollatorForSupervisedDataset(object):
         input_ids, labels = tuple(
             [instance[key] for instance in instances] for key in ("input_ids", "labels")
         )
+        # Recorded before padding: a position is real iff it is inside the
+        # sequence's own length. Deriving the mask from token *identity*
+        # (`input_ids.ne(pad_token_id)`) would be wrong here -- every target ends
+        # with a genuine `eos_token` (see SupervisedDataset), so if the tokenizer
+        # pads with EOS, that real, predicted token would be masked out as padding.
+        lengths = torch.tensor([ids.shape[0] for ids in input_ids])
+
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
+        # long rather than bool, matching the dtype the sampler feeds LLaDA in
+        # `generate.py` (the path that has been checked against modeling_llada.py)
+        attention_mask = (
+            torch.arange(input_ids.shape[1])[None, :] < lengths[:, None]
+        ).long()
+        return dict(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
 
 
 def make_supervised_data_module(
@@ -273,7 +281,18 @@ class LladaSFTTrainer(Trainer):
 
         noisy_batch = torch.where(masked_indices, self.mask_id, input_ids)
 
-        logits = model(input_ids=noisy_batch).logits
+        # Padding is excluded from attention. LLaDA attends *bidirectionally*, so
+        # without this every real token of a short example attends to the padding
+        # that its longer batch-mate forced onto the batch -- i.e. an example's
+        # hidden states depend on who it was collated with. It also keeps the
+        # padding out of NA-LoRTA's mask-proportion statistic, which takes the
+        # attention_mask into account when it is given one
+        # (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`);
+        # otherwise pad positions inflate that proportion's denominator without
+        # ever contributing to its numerator.
+        logits = model(
+            input_ids=noisy_batch, attention_mask=inputs["attention_mask"]
+        ).logits
 
         # 1/t reweighting and per-example answer-length normalisation
         answer_lengths = (
@@ -659,6 +678,44 @@ def _write_benchmark_result(output_dir: str, result: Dict):
     print(f"Wrote benchmark result -> {path}")
 
 
+def _assert_adapter_loaded(model, adapter_dir):
+    """Fail loudly if the saved adapter tensors did not land in the model.
+
+    PEFT loads adapter weights with `load_state_dict(..., strict=False)` and no
+    caller inspects the result, so a key-naming mismatch drops every tensor without
+    raising. What is left is the freshly *initialised* adapter, whose `lora_B` is
+    zero -- an exactly-zero delta, i.e. the bare base model. That silently
+    benchmarks the wrong thing, and every adapter then scores identically, so
+    check that the weights on disk really are the weights in the model.
+    """
+    from peft import load_peft_weights
+    from peft.utils import get_peft_model_state_dict
+
+    saved = load_peft_weights(adapter_dir, device="cpu")
+    # `get_peft_model_state_dict` is what wrote the file, so it names tensors the
+    # same way on the way back out -- for LoRA (per-adapter ModuleDicts) as well as
+    # for LoRTA (flat parameters). Comparing through it keeps this check agnostic
+    # to each tuner's naming convention. save_embedding_layers=False: no embedding
+    # layer is targeted here, and "auto" would probe the HF hub.
+    current = get_peft_model_state_dict(model, save_embedding_layers=False)
+
+    missing, mismatched = [], []
+    for key, value in saved.items():
+        loaded = current.get(key)
+        if loaded is None:
+            missing.append(key)
+        elif not torch.allclose(loaded.detach().cpu().float(), value.cpu().float()):
+            mismatched.append(key)
+
+    if missing or mismatched:
+        raise RuntimeError(
+            f"Adapter in {adapter_dir} was not loaded into the model: "
+            f"{len(missing)} key(s) absent from the model ({missing}), "
+            f"{len(mismatched)} key(s) present but not equal to the saved tensor "
+            f"({mismatched}). Benchmarking would score the base model instead."
+        )
+
+
 def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
     """Load base model + trained adapter and score GSM8K test accuracy."""
     from peft import PeftModel
@@ -671,6 +728,8 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(model, adapter_dir)
+    # Checked on the CPU model, before the .to(device) below, so it is cheap.
+    _assert_adapter_loaded(model, adapter_dir)
     # `training_args.device` is this rank's own GPU (cuda:LOCAL_RANK under
     # torchrun); "cuda" would pile every rank onto cuda:0. No DDP wrapper: this
     # is pure inference, the ranks only talk to each other at the final gather.

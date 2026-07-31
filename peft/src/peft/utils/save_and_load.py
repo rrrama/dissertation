@@ -220,29 +220,38 @@ def set_peft_model_state_dict(model, peft_model_state_dict, adapter_name="defaul
         PeftType.LORTA,
         PeftType.NALORTA
     ):
-        peft_model_state_dict = {}
-        parameter_prefix = {
-            PeftType.IA3: "ia3_",
-            PeftType.LORA: "lora_",
-            PeftType.ADALORA: "lora_",
-            PeftType.LOHA: "hada_",
-            PeftType.LOKR: "lokr_",
-            PeftType.OFT: "oft_",
-            PeftType.POLY: "poly_",
-            PeftType.LORTA: "lora_",
-            PeftType.NALORTA: "lora_"
-        }[config.peft_type]
-        for k, v in state_dict.items():
-            if parameter_prefix in k:
-                suffix = k.split(parameter_prefix)[1]
-                if "." in suffix:
-                    suffix_to_replace = ".".join(suffix.split(".")[1:])
-                    k = k.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+        if config.peft_type in (PeftType.LORTA, PeftType.NALORTA):
+            # LoRTA / NA-LoRTA hold their tensor factors as flat `nn.Parameter`s on the
+            # base model (`base_model.model.lora_A`, `...lora_C_l`, ...) instead of the
+            # per-adapter ModuleDicts the other tuners use, so the saved keys already
+            # match the module's own keys. Running them through the rewrite below would
+            # rename every tensor to a key that does not exist (`...lora_A.default`) and,
+            # because the load is `strict=False`, drop the entire adapter silently --
+            # leaving a freshly initialised adapter whose `lora_B` is zero, i.e. the bare
+            # base model.
+            peft_model_state_dict = state_dict
+        else:
+            peft_model_state_dict = {}
+            parameter_prefix = {
+                PeftType.IA3: "ia3_",
+                PeftType.LORA: "lora_",
+                PeftType.ADALORA: "lora_",
+                PeftType.LOHA: "hada_",
+                PeftType.LOKR: "lokr_",
+                PeftType.OFT: "oft_",
+                PeftType.POLY: "poly_",
+            }[config.peft_type]
+            for k, v in state_dict.items():
+                if parameter_prefix in k:
+                    suffix = k.split(parameter_prefix)[1]
+                    if "." in suffix:
+                        suffix_to_replace = ".".join(suffix.split(".")[1:])
+                        k = k.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+                    else:
+                        k = f"{k}.{adapter_name}"
+                    peft_model_state_dict[k] = v
                 else:
-                    k = f"{k}.{adapter_name}"
-                peft_model_state_dict[k] = v
-            else:
-                peft_model_state_dict[k] = v
+                    peft_model_state_dict[k] = v
         if config.peft_type == PeftType.ADALORA:
             rank_pattern = config.rank_pattern
             if rank_pattern is not None:
