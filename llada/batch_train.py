@@ -16,13 +16,20 @@ point in the product this script:
 Each per-run job runs ``torchrun train.py --config <frozen config.yaml>``
 (train mode) or ``python train.py --mode benchmark ...`` (benchmark mode).
 
+``--mode all`` submits both per run and chains them with a slurm dependency
+(``afterok``), so a sweep goes from config to benchmarked adapters without
+intervention: every run trains in parallel and each benchmark starts as soon as
+*its own* training exits 0.
+
 Re-running a config in train mode is safe: runs that already have a saved
 adapter are skipped, so only the missing points of a sweep are submitted. Pass
 ``--overwrite`` to retrain (and clobber) finished runs.
 
 Usage:
-    python batch_train.py --mode train     --config configs/run001_baseline.yaml
+    python batch_train.py --mode train      --config configs/run001_baseline.yaml
     python batch_train.py --mode benchmark  --config configs/run001_baseline.yaml
+    python batch_train.py --mode all        --config configs/run001_baseline.yaml
+    python batch_train.py --mode summary    --config configs/run001_baseline.yaml
 
 This script only depends on PyYAML + the stdlib so it can run on a login node
 without importing torch/transformers.
@@ -32,6 +39,7 @@ import argparse
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -248,22 +256,35 @@ def write_sbatch(mode, run_cfg, config_name, name, config_path, run_dir, log_dir
     return sbatch_path
 
 
-def submit(sbatch_path, no_submit):
+def submit(sbatch_path, no_submit, after_job=None):
+    """Submit a job, optionally gated on another job finishing successfully.
+
+    Returns the slurm job id (as a string) so callers can chain dependencies,
+    or None if nothing was submitted.
+
+    ``after_job`` adds ``--dependency=afterok:<id>``: the job stays queued until
+    the dependency exits 0, and ``--kill-on-invalid-dep`` cancels it outright if
+    the dependency fails, rather than leaving it pending forever.
+    """
+    cmd = ["sbatch"]
+    if after_job:
+        cmd += [f"--dependency=afterok:{after_job}", "--kill-on-invalid-dep=yes"]
+    cmd.append(sbatch_path)
+
     if no_submit:
-        print(f"  [no-submit] would run: sbatch {sbatch_path}")
+        print(f"  [no-submit] would run: {' '.join(cmd)}")
         return None
     if shutil.which("sbatch") is None:
         print(f"  [warn] sbatch not found; skipping submit of {sbatch_path}")
         return None
-    result = subprocess.run(
-        ["sbatch", sbatch_path], capture_output=True, text=True
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  [error] sbatch failed: {result.stderr.strip()}")
         return None
     job_line = result.stdout.strip()
     print(f"  submitted: {job_line}")
-    return job_line
+    match = re.search(r"(\d+)", job_line)
+    return match.group(1) if match else None
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +386,83 @@ def run_train_mode(config, config_name, no_submit, overwrite):
     write_summary(exp_dir, runs_info, "train")
 
 
+def run_all_mode(config, config_name, no_submit, overwrite):
+    """Submit train + benchmark for every run, chained by a slurm dependency.
+
+    Unlike `--mode benchmark`, this does not require an adapter to exist on disk
+    yet: the `afterok` dependency is what gates the benchmark, so a fresh sweep
+    goes from config to results in one command.
+    """
+    runs = expand_runs(config)
+    names = _unique_names(runs)
+    exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
+    os.makedirs(exp_dir, exist_ok=True)
+
+    print(f"Expanded to {len(runs)} run(s) under {exp_dir}")
+    runs_info = []
+    reused = []
+    for idx, ((run_cfg, varying), name) in enumerate(zip(runs, names)):
+        run_dir = os.path.join(exp_dir, name)
+        info = {"name": name, "run_dir": run_dir, "varying": varying}
+        print(f"[{idx + 1}/{len(runs)}] {name}")
+
+        if _is_trained(run_dir) and not overwrite:
+            # Adapter already on disk: nothing to train, so the benchmark goes
+            # straight onto the queue with no dependency.
+            reused.append(name)
+            log_dir = os.path.join(run_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            config_path = os.path.join(run_dir, "config.yaml")
+            train_job = None
+        else:
+            run_dir, log_dir = _prepare_run_dir(exp_dir, name)
+            config_path = _freeze_config(run_cfg, run_dir)
+            with open(os.path.join(run_dir, "metadata.json"), "w") as f:
+                json.dump(build_metadata(run_cfg, varying), f, indent=2)
+            train_sbatch = write_sbatch(
+                "train", run_cfg, config_name, name, config_path, run_dir, log_dir
+            )
+            train_job = submit(train_sbatch, no_submit)
+            if no_submit:
+                # Keep the dry run readable: show the dependency that a real
+                # submit would attach.
+                train_job = "<train_job_id>"
+            elif train_job is None:
+                print("  [error] train job not submitted; skipping its benchmark")
+                runs_info.append(info)
+                continue
+
+        bench_sbatch = write_sbatch(
+            "benchmark", run_cfg, config_name, name, config_path, run_dir, log_dir
+        )
+        submit(bench_sbatch, no_submit, after_job=train_job)
+        runs_info.append(info)
+
+    if reused:
+        print(
+            f"[skip] {len(reused)}/{len(runs)} run(s) already trained; benchmarked "
+            f"against the existing adapter (pass --overwrite to retrain): "
+            f"{', '.join(reused)}"
+        )
+
+    write_summary(exp_dir, runs_info, "all")
+
+
+def run_summary_mode(config, config_name):
+    """Refresh summary.json from whatever results are on disk. Submits nothing."""
+    runs = expand_runs(config)
+    names = _unique_names(runs)
+    exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
+    if not os.path.isdir(exp_dir):
+        print(f"[error] no output directory for this config: {exp_dir}")
+        return
+    runs_info = [
+        {"name": name, "run_dir": os.path.join(exp_dir, name), "varying": varying}
+        for (_, varying), name in zip(runs, names)
+    ]
+    write_summary(exp_dir, runs_info, "summary")
+
+
 def run_benchmark_mode(config, config_name, no_submit):
     runs = expand_runs(config)
     names = _unique_names(runs)
@@ -420,7 +518,16 @@ def run_benchmark_mode(config, config_name, no_submit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["train", "benchmark"], default="train")
+    parser.add_argument(
+        "--mode",
+        choices=["train", "benchmark", "all", "summary"],
+        default="train",
+        help=(
+            "train/benchmark submit one job per run; 'all' submits both and "
+            "chains the benchmark behind training with a slurm dependency; "
+            "'summary' only refreshes summary.json from results on disk."
+        ),
+    )
     parser.add_argument("--config", required=True, help="Experiment YAML config.")
     parser.add_argument(
         "--no-submit",
@@ -444,6 +551,10 @@ def main():
 
     if args.mode == "train":
         run_train_mode(config, config_name, args.no_submit, args.overwrite)
+    elif args.mode == "all":
+        run_all_mode(config, config_name, args.no_submit, args.overwrite)
+    elif args.mode == "summary":
+        run_summary_mode(config, config_name)
     else:
         run_benchmark_mode(config, config_name, args.no_submit)
 
