@@ -113,6 +113,15 @@ class TrainingArguments(transformers.TrainingArguments):
     gen_temperature: float = field(
         default=0.0, metadata={"help": "Gumbel sampling temperature (0 = greedy)."}
     )
+    benchmark_batch_size: int = field(
+        default=8,
+        metadata={
+            "help": "Questions decoded simultaneously per rank in benchmark mode. "
+            "A single 320-token forward badly underuses an L40; memory is the "
+            "limit (the (B, S, vocab) logits dominate). 1 reproduces the old "
+            "one-question-at-a-time path exactly."
+        },
+    )
 
 
 def _tokenize_fn(
@@ -195,17 +204,25 @@ class DataCollatorForSupervisedDataset(object):
         input_ids, labels = tuple(
             [instance[key] for instance in instances] for key in ("input_ids", "labels")
         )
+        # Recorded before padding: a position is real iff it is inside the
+        # sequence's own length. Deriving the mask from token *identity*
+        # (`input_ids.ne(pad_token_id)`) would be wrong here -- every target ends
+        # with a genuine `eos_token` (see SupervisedDataset), so if the tokenizer
+        # pads with EOS, that real, predicted token would be masked out as padding.
+        lengths = torch.tensor([ids.shape[0] for ids in input_ids])
+
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         labels = torch.nn.utils.rnn.pad_sequence(
             labels, batch_first=True, padding_value=IGNORE_INDEX
         )
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
+        # long rather than bool, matching the dtype the sampler feeds LLaDA in
+        # `generate.py` (the path that has been checked against modeling_llada.py)
+        attention_mask = (
+            torch.arange(input_ids.shape[1])[None, :] < lengths[:, None]
+        ).long()
+        return dict(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
 
 
 def make_supervised_data_module(
@@ -264,7 +281,18 @@ class LladaSFTTrainer(Trainer):
 
         noisy_batch = torch.where(masked_indices, self.mask_id, input_ids)
 
-        logits = model(input_ids=noisy_batch).logits
+        # Padding is excluded from attention. LLaDA attends *bidirectionally*, so
+        # without this every real token of a short example attends to the padding
+        # that its longer batch-mate forced onto the batch -- i.e. an example's
+        # hidden states depend on who it was collated with. It also keeps the
+        # padding out of NA-LoRTA's mask-proportion statistic, which takes the
+        # attention_mask into account when it is given one
+        # (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`);
+        # otherwise pad positions inflate that proportion's denominator without
+        # ever contributing to its numerator.
+        logits = model(
+            input_ids=noisy_batch, attention_mask=inputs["attention_mask"]
+        ).logits
 
         # 1/t reweighting and per-example answer-length normalisation
         answer_lengths = (
@@ -298,15 +326,91 @@ def _gather_predictions(local_indices, local_preds, total, world_size):
     return preds
 
 
+def _pad_token_id(tokenizer):
+    """A token id to left-pad prompts with. Must not be the MASK id."""
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None or pad_id == MASK_ID:
+        raise ValueError(
+            f"tokenizer has no usable pad token for batched decoding (got {pad_id})"
+        )
+    return pad_id
+
+
+def _stack_prompts(prompt_ids, pad_id, device):
+    """Stack 1-D prompt id tensors into (B, len) ids + an attention mask.
+
+    Equal-length prompts (what `_uniform_length_batches` produces) need no
+    padding and get `attention_mask=None`, which is not just tidier: LLaDA's
+    `modeling_llada.py` tests `0.0 in attention_mask` on every forward, and that
+    membership test is a device sync -- 256 of them per question.
+
+    Ragged input is still supported, and is padded on the *left*: the sampler
+    shares one block boundary across the batch, so every row's response region
+    has to start at the same offset. Note that ragged batches are not
+    output-preserving under NA-LoRTA; see `_uniform_length_batches`.
+    """
+    lengths = {ids.shape[0] for ids in prompt_ids}
+    if len(lengths) == 1:
+        return torch.stack(prompt_ids).to(device), None
+
+    max_len = max(lengths)
+    batch = torch.full((len(prompt_ids), max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((len(prompt_ids), max_len), dtype=torch.long)
+    for row, ids in enumerate(prompt_ids):
+        batch[row, max_len - ids.shape[0] :] = ids
+        attention_mask[row, max_len - ids.shape[0] :] = 1
+    return batch.to(device), attention_mask.to(device)
+
+
+def _uniform_length_batches(local_indices, prompt_ids, batch_size):
+    """Group a rank's questions into batches whose prompts are all the same length.
+
+    Batching only questions of identical prompt length keeps decoding exactly
+    output-preserving, which batching by *similar* length would not be. NA-LoRTA
+    modulates its adapter weights by the proportion of the input that is MASK
+    (`peft/src/peft/tuners/nalorta/model.py:193`), and that proportion is a single
+    scalar pooled over the whole batch. At any given sampling step every row has
+    the same *count* of masked tokens (they share the transfer schedule), so the
+    proportion differs across rows only through the denominator -- i.e. the prompt
+    length. Equal lengths make the pooled scalar identical to the per-row value,
+    so every question sees the same adapter weights it would at batch size 1.
+
+    It also means zero padding, and padding is pure waste: a padded position
+    still costs a full forward at each of the 256 steps.
+
+    The price is that batches are capped by how many questions happen to share a
+    length, so they are variable-sized and often smaller than `batch_size`.
+    """
+    by_length = {}
+    for i in local_indices:
+        by_length.setdefault(prompt_ids[i].shape[0], []).append(i)
+
+    batches = []
+    for length in sorted(by_length):
+        group = by_length[length]
+        batches += [group[k : k + batch_size] for k in range(0, len(group), batch_size)]
+    return batches
+
+
 @torch.no_grad()
 def diffusion_evaluate(model, tokenizer, test_set, training_args):
-    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler (one Q at a time).
+    """Evaluate GSM8K accuracy using the LLaDA diffusion sampler.
 
-    Sampling is sequential and single-question, so the only parallelism available
-    is over the test set: under torchrun each rank samples an interleaved shard of
-    the questions on its own GPU and the predictions are gathered back into test-set
-    order before scoring. This is exact -- every question is decoded exactly as it
-    would be on one GPU, it just takes 1/world_size of the wall clock.
+    Two levels of parallelism, both over the test set (the 256 sampling steps
+    themselves are inherently sequential):
+
+      - across ranks: under torchrun each rank samples an interleaved shard of the
+        questions on its own GPU, and the predictions are gathered back into
+        test-set order before scoring;
+      - within a rank: up to `benchmark_batch_size` questions are decoded in one
+        batch, which is where most of the speedup is -- a batch-1 320-token
+        forward leaves an L40 mostly idle.
+
+    Both are exact: every question is decoded exactly as it would be alone on one
+    GPU. Batches are restricted to questions of identical prompt length to keep
+    that true under NA-LoRTA -- see `_uniform_length_batches`.
     """
     model.eval()
 
@@ -326,19 +430,35 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     # of them straggles at the end.
     local_indices = list(range(rank, len(questions), world_size))
 
-    local_preds = []
-    for i in tqdm(
-        local_indices,
+    prompt_ids = {
+        i: tokenizer(questions[i], return_tensors="pt")["input_ids"][0]
+        for i in local_indices
+    }
+    pad_id = _pad_token_id(tokenizer)
+    batch_size = max(1, int(training_args.benchmark_batch_size))
+    batches = _uniform_length_batches(local_indices, prompt_ids, batch_size)
+    if rank == 0:
+        mean_batch = len(local_indices) / max(1, len(batches))
+        print(
+            f"[rank {rank}] {len(local_indices)} questions -> {len(batches)} batches "
+            f"(cap {batch_size}, mean {mean_batch:.1f}); batches hold equal-length "
+            f"prompts only, so decoding is exact"
+        )
+
+    preds_by_index = {}
+    progress = tqdm(
         total=len(local_indices),
         desc=f"Evaluating (diffusion) [rank {rank}]",
         disable=rank != 0,
-    ):
-        input_ids = tokenizer(questions[i], return_tensors="pt")["input_ids"].to(
-            model.device
+    )
+    for batch_indices in batches:
+        input_ids, attention_mask = _stack_prompts(
+            [prompt_ids[i] for i in batch_indices], pad_id, model.device
         )
         out = generate(
             model,
             input_ids,
+            attention_mask=attention_mask,
             steps=training_args.diffusion_steps,
             gen_length=training_args.gen_length,
             block_length=training_args.block_length,
@@ -346,12 +466,18 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
             remasking=training_args.remasking,
             mask_id=training_args.mask_id,
         )
+        # left padding means the response region starts at the same offset in
+        # every row of the batch
         gen_tokens = out[:, input_ids.shape[1] :]
-        decoded = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)[0]
-        if rank == 0:
-            print(decoded)
-        local_preds.append(extract_answer_number(decoded))
+        decoded_batch = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
+        for i, decoded in zip(batch_indices, decoded_batch):
+            if rank == 0:
+                print(decoded)
+            preds_by_index[i] = extract_answer_number(decoded)
+        progress.update(len(batch_indices))
+    progress.close()
 
+    local_preds = [preds_by_index[i] for i in local_indices]
     ans_pred_list = _gather_predictions(
         local_indices, local_preds, len(questions), world_size
     )
@@ -552,6 +678,44 @@ def _write_benchmark_result(output_dir: str, result: Dict):
     print(f"Wrote benchmark result -> {path}")
 
 
+def _assert_adapter_loaded(model, adapter_dir):
+    """Fail loudly if the saved adapter tensors did not land in the model.
+
+    PEFT loads adapter weights with `load_state_dict(..., strict=False)` and no
+    caller inspects the result, so a key-naming mismatch drops every tensor without
+    raising. What is left is the freshly *initialised* adapter, whose `lora_B` is
+    zero -- an exactly-zero delta, i.e. the bare base model. That silently
+    benchmarks the wrong thing, and every adapter then scores identically, so
+    check that the weights on disk really are the weights in the model.
+    """
+    from peft import load_peft_weights
+    from peft.utils import get_peft_model_state_dict
+
+    saved = load_peft_weights(adapter_dir, device="cpu")
+    # `get_peft_model_state_dict` is what wrote the file, so it names tensors the
+    # same way on the way back out -- for LoRA (per-adapter ModuleDicts) as well as
+    # for LoRTA (flat parameters). Comparing through it keeps this check agnostic
+    # to each tuner's naming convention. save_embedding_layers=False: no embedding
+    # layer is targeted here, and "auto" would probe the HF hub.
+    current = get_peft_model_state_dict(model, save_embedding_layers=False)
+
+    missing, mismatched = [], []
+    for key, value in saved.items():
+        loaded = current.get(key)
+        if loaded is None:
+            missing.append(key)
+        elif not torch.allclose(loaded.detach().cpu().float(), value.cpu().float()):
+            mismatched.append(key)
+
+    if missing or mismatched:
+        raise RuntimeError(
+            f"Adapter in {adapter_dir} was not loaded into the model: "
+            f"{len(missing)} key(s) absent from the model ({missing}), "
+            f"{len(mismatched)} key(s) present but not equal to the saved tensor "
+            f"({mismatched}). Benchmarking would score the base model instead."
+        )
+
+
 def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
     """Load base model + trained adapter and score GSM8K test accuracy."""
     from peft import PeftModel
@@ -564,6 +728,8 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         trust_remote_code=True,
     )
     model = PeftModel.from_pretrained(model, adapter_dir)
+    # Checked on the CPU model, before the .to(device) below, so it is cheap.
+    _assert_adapter_loaded(model, adapter_dir)
     # `training_args.device` is this rank's own GPU (cuda:LOCAL_RANK under
     # torchrun); "cuda" would pile every rank onto cuda:0. No DDP wrapper: this
     # is pure inference, the ranks only talk to each other at the final gather.
