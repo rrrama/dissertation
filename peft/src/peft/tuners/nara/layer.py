@@ -342,7 +342,11 @@ class NARALayer(BaseTunerLayer):
                 f"Per-example C has batch size {c.shape[0]} but the activations have {h.shape[0]}. "
                 "This usually means the batch was reshaped between computing C and reaching the layer."
             )
-        return torch.einsum("b...r,brk->b...k", h, c)
+        # Flatten everything between batch and rank so this is one bmm regardless of how many
+        # dimensions the layer type puts in the middle.
+        lead = h.shape[:-1]
+        out = torch.bmm(h.reshape(lead[0], -1, h.shape[-1]), c)
+        return out.reshape(*lead, c.shape[-1])
 
     def _mixed_batch_forward(
         self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
