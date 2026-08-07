@@ -55,6 +55,8 @@ from .tuners import (
     LorTaConfig,
     NALorTaModel,
     NALorTaConfig,
+    NARAModel,
+    NARAConfig,
     LoHaConfig,
     LoHaModel,
     LoKrConfig,
