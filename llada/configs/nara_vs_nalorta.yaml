@@ -1,0 +1,56 @@
+# Head-to-head comparison of NA-LoRTA vs NaRA on GSM8K.
+# `tuning_type` is a list -> two runs (nalorta, nara) with every other
+# hyperparameter held fixed, so any difference is attributable to the adapter.
+#
+# Both adapters are conditioned on the same signal: the masked proportion of the
+# *answer*, threaded in via the `response_mask` forward kwarg. They differ in what
+# they do with it -- NA-LoRTA modulates a shared rank vector across a factorised
+# tensor, NaRA mixes each layer's own A/B through an r x r matrix C(lambda).
+#
+# NaRA's own LLaDA config uses lr 1e-4, but it scales its delta by `scale_ab`
+# alone and ignores `lora_alpha`, whereas this port uses PEFT's `lora_alpha / r`
+# so the two adapters share a scaling convention. That makes neither repo's
+# learning rate transferable -- expect to sweep it. The value below is the one
+# `lorta_vs_nalorta.yaml` uses, i.e. a starting point, not a tuned number.
+
+model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+tuning_type: ["nalorta", "nara"]
+rank: 128
+lora_alpha: 4
+
+data_name: "gsm8k"
+
+learning_rate: 0.05
+num_train_epochs: 6
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 10
+gradient_checkpointing: false
+warmup_ratio: 0.03
+lr_scheduler_type: "cosine"
+seed: 42
+model_max_length: 512
+
+expt_name: "llada_gsm8k_training"
+wandb_project: "llada_gsm8k_training"
+report_to: "wandb"
+logging_strategy: "steps"
+logging_steps: 10
+save_strategy: "steps"
+save_steps: 100
+eval_steps: 100
+
+mask_id: 126336
+diffusion_eps: 0.001
+gen_length: 256
+diffusion_steps: 256
+block_length: 256
+remasking: "low_confidence"
+gen_temperature: 0.0
+# questions decoded simultaneously per rank in benchmark mode (1 = the old
+# one-at-a-time path); memory-bound, see BENCHMARK_PERF.md §4
+benchmark_batch_size: 8
+
+nproc_per_node: 3
+gres: "gpu:lovelace_l40:3"
+
+benchmark: "gsm8k_accuracy"

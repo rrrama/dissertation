@@ -57,7 +57,7 @@ class ModelArguments:
     )
     tuning_type: str = field(
         default="lorta",
-        metadata={"help": "Type of tuning to use: 'lora' or 'lorta'."},
+        metadata={"help": "Adapter to train: 'lora', 'lorta', 'nalorta' or 'nara'."},
     )
 
 
@@ -579,6 +579,30 @@ def _build_peft_config(model_args):
             task_type="CAUSAL_LM",
             init_lora_weights=True,
             embedding_length=32,
+        )
+    elif model_args.tuning_type == "nara":
+        from peft import NARAConfig
+
+        # Reference hyperparameters from NaRA's own LLaDA config
+        # (NaRA/config/nara/llada_instruct_nara_math14k.yaml), except for the scaling
+        # convention: NaRA scales its delta by `scale_ab` alone and leaves `lora_alpha`
+        # unused, while this uses PEFT's `lora_alpha / r` so the run is comparable to
+        # lora/lorta/nalorta under the same sweep. That makes the reference `lr: 1e-4`
+        # meaningless here -- sweep the learning rate rather than trusting either number.
+        return NARAConfig(
+            r=model_args.rank,
+            lora_alpha=model_args.lora_alpha,
+            target_modules=llada_target_modules,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            init_lora_weights=True,
+            embedding_dim=64,
+            embedding_type="fourier",
+            fnn_hidden_size_1=256,
+            fnn_hidden_size_2=512,
+            c_scale=0.1,
+            input_mode="nl",
         )
     raise ValueError(f"Unknown tuning_type: {model_args.tuning_type}")
 
