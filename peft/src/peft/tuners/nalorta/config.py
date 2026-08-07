@@ -139,6 +139,19 @@ class NALorTaConfig(PeftConfig):
             "that is added to the rank identity when computing the NALoRTA weights."
         },
     )
+    lambda_source: Literal["response", "non_padding"] = field(
+        default="response",
+        metadata={
+            "help": (
+                "Denominator of the mask proportion the adapter is conditioned on. 'response' (default) "
+                "divides by the answer tokens only and requires the caller to pass a `response_mask` "
+                "kwarg to the forward. 'non_padding' divides by every non-padding token, prompt included; "
+                "that is the pre-`response_mask` behaviour and is kept only so earlier runs remain "
+                "reproducible -- it caps the proportion below 1.0 by a per-example, prompt-length-dependent "
+                "factor and shifts between training and generation."
+            )
+        },
+    )
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
         default=False,

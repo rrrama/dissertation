@@ -154,9 +154,17 @@ def generate(
     )
     x[:, :prompt_len] = prompt.to(device)
 
-    if attention_mask is None:
-        model_kwargs = {}
-    else:
+    # The response region is always the trailing `gen_length` columns, so the mask the
+    # noise-aware adapters need for their lambda denominator is a constant of the layout.
+    # PEFT strips `response_mask` before LLaDA is called, so passing it is safe for every
+    # tuning type (see `peft_model.PeftModel.special_peft_forward_args`).
+    response_mask = torch.zeros(
+        (batch_size, prompt_len + gen_length), dtype=torch.bool, device=device
+    )
+    response_mask[:, prompt_len:] = True
+    model_kwargs = {"response_mask": response_mask}
+
+    if attention_mask is not None:
         attention_mask = attention_mask.to(device)
         assert attention_mask.shape == prompt.shape, (
             f"attention_mask {tuple(attention_mask.shape)} does not match prompt "
@@ -175,7 +183,7 @@ def generate(
             ],
             dim=1,
         )
-        model_kwargs = {"attention_mask": full_attention_mask}
+        model_kwargs["attention_mask"] = full_attention_mask
 
     prompt_index = x != mask_id
 

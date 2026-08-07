@@ -122,7 +122,14 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self.peft_type = peft_config.peft_type
         # These args are special PEFT arguments that users can pass. They need to be removed before passing them to
         # forward.
-        self.special_peft_forward_args = {"adapter_names"}
+        #
+        # `response_mask` is consumed by the noise-aware tuners (NA-LoRTA, NaRA), which condition
+        # their adapter weights on the proportion of the *answer* that is masked. That proportion's
+        # denominator cannot be recovered from `input_ids` alone -- the response contains unmasked
+        # tokens too -- so the caller marks the response region with a boolean `[batch, seq]` mask.
+        # It is visible to `_enable_peft_forward_hooks` and stripped before the base model is
+        # called, so base models that do not accept the kwarg never see it.
+        self.special_peft_forward_args = {"adapter_names", "response_mask"}
 
         self._is_prompt_learning = peft_config.is_prompt_learning
         if self._is_prompt_learning:

@@ -285,13 +285,22 @@ class LladaSFTTrainer(Trainer):
         # without this every real token of a short example attends to the padding
         # that its longer batch-mate forced onto the batch -- i.e. an example's
         # hidden states depend on who it was collated with. It also keeps the
-        # padding out of NA-LoRTA's mask-proportion statistic, which takes the
-        # attention_mask into account when it is given one
+        # padding out of the noise-aware adapters' mask-proportion statistic,
+        # which takes the attention_mask into account when it is given one
         # (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`);
         # otherwise pad positions inflate that proportion's denominator without
         # ever contributing to its numerator.
+        #
+        # `response_mask` marks the answer region. The noise-aware adapters
+        # (NA-LoRTA, NaRA) condition on the masked *proportion of the answer*,
+        # and that denominator is not recoverable from `input_ids`: the response
+        # holds unmasked tokens too. PEFT lists `response_mask` in
+        # `special_peft_forward_args`, so it reaches the tuner and is stripped
+        # before LLaDA is called; the other tuning types simply ignore it.
         logits = model(
-            input_ids=noisy_batch, attention_mask=inputs["attention_mask"]
+            input_ids=noisy_batch,
+            attention_mask=inputs["attention_mask"],
+            response_mask=response_mask,
         ).logits
 
         # 1/t reweighting and per-example answer-length normalisation
@@ -348,8 +357,7 @@ def _stack_prompts(prompt_ids, pad_id, device):
 
     Ragged input is still supported, and is padded on the *left*: the sampler
     shares one block boundary across the batch, so every row's response region
-    has to start at the same offset. Note that ragged batches are not
-    output-preserving under NA-LoRTA; see `_uniform_length_batches`.
+    has to start at the same offset.
     """
     lengths = {ids.shape[0] for ids in prompt_ids}
     if len(lengths) == 1:
@@ -367,18 +375,21 @@ def _stack_prompts(prompt_ids, pad_id, device):
 def _uniform_length_batches(local_indices, prompt_ids, batch_size):
     """Group a rank's questions into batches whose prompts are all the same length.
 
-    Batching only questions of identical prompt length keeps decoding exactly
-    output-preserving, which batching by *similar* length would not be. NA-LoRTA
-    modulates its adapter weights by the proportion of the input that is MASK
-    (`peft/src/peft/tuners/nalorta/model.py:193`), and that proportion is a single
-    scalar pooled over the whole batch. At any given sampling step every row has
-    the same *count* of masked tokens (they share the transfer schedule), so the
-    proportion differs across rows only through the denominator -- i.e. the prompt
-    length. Equal lengths make the pooled scalar identical to the per-row value,
-    so every question sees the same adapter weights it would at batch size 1.
+    Equal lengths mean zero padding, and padding is pure waste: a padded position
+    still costs a full forward at each of the 256 sampling steps. It also lets
+    `_stack_prompts` return `attention_mask=None`, dodging a per-forward device
+    sync in LLaDA's modeling code.
 
-    It also means zero padding, and padding is pure waste: a padded position
-    still costs a full forward at each of the 256 steps.
+    This also used to be what kept decoding output-preserving under NA-LoRTA,
+    whose adapter weights are modulated by a mask proportion pooled to a single
+    scalar over the batch: with a prompt+answer denominator that proportion
+    varied across rows through the prompt length, so only equal lengths made the
+    pooled scalar equal each row's own value. The denominator is now the answer
+    only (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`), which
+    at generation time is a constant `gen_length` for every row, and every row
+    shares the transfer schedule and so the same masked *count* -- so the pooled
+    scalar is already exact for any batch. Equal-length batching is now a
+    performance choice rather than a correctness one.
 
     The price is that batches are capped by how many questions happen to share a
     length, so they are variable-sized and often smaller than `batch_size`.
@@ -409,8 +420,8 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
         forward leaves an L40 mostly idle.
 
     Both are exact: every question is decoded exactly as it would be alone on one
-    GPU. Batches are restricted to questions of identical prompt length to keep
-    that true under NA-LoRTA -- see `_uniform_length_batches`.
+    GPU. Batches are restricted to questions of identical prompt length, which
+    eliminates padding -- see `_uniform_length_batches`.
     """
     model.eval()
 

@@ -136,20 +136,50 @@ class NALorTaModel(BaseTuner):
 
     def __init__(self, model, config, adapter_name) -> None:
         super().__init__(model, config, adapter_name)
+        # Set by `_enable_peft_forward_hooks` for the duration of one forward; see `forward`.
+        self._response_mask = None
 
-    def _mask_token_proportion(self, input_ids, attention_mask=None) -> torch.Tensor:
-        """Proportion of the input that is the mask token.
+    def _mask_token_proportion(self, input_ids, attention_mask=None, response_mask=None) -> torch.Tensor:
+        """Proportion of the *answer* that is the mask token.
+
+        Masks only ever land in the response, so the numerator is answer-only regardless. The
+        denominator is what matters: it must be the answer length, not the whole sequence. With a
+        prompt+answer denominator the statistic is ``t * L_ans / (L_prompt + L_ans)`` rather than
+        ``t`` -- it can never reach 1.0, it compresses by a per-example factor that depends on
+        prompt length, and the ceiling differs between training (true answer length) and
+        generation (fixed ``gen_length``). Callers therefore pass ``response_mask``.
 
         Args:
             input_ids (`torch.Tensor`): Token ids of shape ``[batch, seq]`` (or ``[seq]``).
             attention_mask (`torch.Tensor`, *optional*): Same shape as ``input_ids``; padding
                 positions (value ``0``) are excluded from the count when provided.
+            response_mask (`torch.Tensor`, *optional*): Same shape as ``input_ids``; truthy exactly
+                on the response (answer) positions. When absent the denominator falls back to every
+                non-padding token and a warning is raised -- that is the pre-`response_mask`
+                behaviour, kept only so old runs stay reproducible.
 
         Returns:
-            `torch.Tensor`: A scalar in ``[0, 1]`` giving the fraction of (non-padding) tokens
-            that equal ``MASK_TOKEN_ID``.
+            `torch.Tensor`: A scalar in ``[0, 1]`` giving the fraction of (non-padding) answer
+            tokens that equal ``MASK_TOKEN_ID``.
         """
         is_mask = input_ids == self.MASK_TOKEN_ID
+
+        lambda_source = getattr(self.peft_config[self.active_adapters[0]], "lambda_source", "response")
+        if lambda_source == "response":
+            if response_mask is None:
+                warnings.warn(
+                    "NA-LoRTA is configured with `lambda_source='response'` but no `response_mask` was "
+                    "passed to the forward; falling back to a prompt+answer denominator, which caps the "
+                    "mask proportion below 1.0 by a per-example factor. Pass `response_mask=...` (a "
+                    "boolean [batch, seq] tensor marking the answer) to the model call, or set "
+                    "`lambda_source='non_padding'` to select this behaviour deliberately."
+                )
+            else:
+                valid = response_mask.bool()
+                if attention_mask is not None:
+                    valid = valid & attention_mask.bool()
+                return (is_mask & valid).sum() / valid.sum().clamp(min=1)
+
         if attention_mask is not None:
             valid = attention_mask.bool()
             return (is_mask & valid).sum() / valid.sum().clamp(min=1)
@@ -180,7 +210,7 @@ class NALorTaModel(BaseTuner):
     def _map_layer_to_adapter(self, layer_idx: int, target_matrix: str) -> str:
         return ".".join([self.target_names_prefix, f"{layer_idx}", self.qkvo_mapping[target_matrix]])
 
-    def _compute_weights_from_tensor(self, input_ids=None, attention_mask=None):
+    def _compute_weights_from_tensor(self, input_ids=None, attention_mask=None, response_mask=None):
         weights = {}
         # print("*"*100)
         # print(self.adapter_name_to_module)
@@ -190,7 +220,7 @@ class NALorTaModel(BaseTuner):
         # identity (ones) so that when there is no mask (or no input_ids) we recover the base NALoRTA weights.
         c_mask = torch.ones_like(self.model.lora_C_m[0])
         if input_ids is not None:
-            mask_proportion = self._mask_token_proportion(input_ids, attention_mask)
+            mask_proportion = self._mask_token_proportion(input_ids, attention_mask, response_mask)
             # GaussianFourierProjection expects a 1-D batch; phi has shape (embedding_length,).
             phi = self.model.lora_phi(mask_proportion.reshape(1)).reshape(-1)
             phi = phi.to(self.model.lora_Theta.dtype)
@@ -258,7 +288,11 @@ class NALorTaModel(BaseTuner):
     def forward(self, *args, **kwargs):
         input_ids = kwargs.get("input_ids", args[0] if args else None)
         attention_mask = kwargs.get("attention_mask", None)
-        self.tensor_weights = self._compute_weights_from_tensor(input_ids, attention_mask)
+        # `response_mask` is stripped from kwargs by `PeftModel.forward` before we are called
+        # (it is in `special_peft_forward_args`), so it arrives via `_enable_peft_forward_hooks`,
+        # which runs first and stashes it on `self`.
+        response_mask = getattr(self, "_response_mask", None)
+        self.tensor_weights = self._compute_weights_from_tensor(input_ids, attention_mask, response_mask)
         # print("*"*100)
         # print(self.tensor_weights.keys())
         # kwargs["adapter_weight"] = weights
@@ -685,6 +719,12 @@ class NALorTaModel(BaseTuner):
         # if self.training:
         # raise ValueError("Cannot pass `adapter_names` when the model is in training mode.")
 
+        # `PeftModel.forward` passes its `**kwargs` here *before* stripping the special PEFT args,
+        # so this is the only place `response_mask` is visible; `forward` (which sees input_ids /
+        # attention_mask, but not the stripped kwargs) reads it back off `self`. Scoped to the
+        # context so a forward outside it cannot silently reuse a stale mask.
+        self._response_mask = kwargs.get("response_mask", None)
+
         hook_handles = []
         names_with_hooks = []
         for name, module in self.model.named_modules():
@@ -697,13 +737,12 @@ class NALorTaModel(BaseTuner):
                 handle = module.register_forward_pre_hook(pre_forward, with_kwargs=True)
                 hook_handles.append(handle)
                 names_with_hooks.append(name)
-        yield
-        # print("*"*100)
-        # print("Hooked layers")
-        # print(names_with_hooks)
-
-        for handle in hook_handles:
-            handle.remove()
+        try:
+            yield
+        finally:
+            self._response_mask = None
+            for handle in hook_handles:
+                handle.remove()
 
     def _check_merge_allowed(self):
         """Verify that the configuration supports merging.
