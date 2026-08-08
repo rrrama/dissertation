@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import warnings
 from typing import Optional
 
@@ -28,6 +29,12 @@ from .other import (
     infer_device,
 )
 from .peft_types import PeftType
+
+
+# NaRA's per-layer factors are held in per-adapter ModuleDicts and so need the adapter-name
+# key rewrite; its shared mapper (`lora_mapper.*`), lambda embedding (`lora_phi`) and
+# `lora_constant_c` are flat modules on the base model and must pass through untouched.
+_NARA_PER_LAYER_KEY = re.compile(r"lora_(A|B|embedding_A|embedding_B|magnitude_vector)\.")
 
 
 def has_valid_embedding_base_layer(layer):
@@ -122,7 +129,7 @@ def get_peft_model_state_dict(
         to_return = {k: state_dict[k] for k in state_dict if "oft_" in k}
     elif config.peft_type == PeftType.POLY:
         to_return = {k: state_dict[k] for k in state_dict if "poly_" in k}
-    elif config.peft_type in (PeftType.LORTA, PeftType.NALORTA):
+    elif config.peft_type in (PeftType.LORTA, PeftType.NALORTA, PeftType.NARA):
         to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}
     else:
         raise NotImplementedError
@@ -218,7 +225,8 @@ def set_peft_model_state_dict(model, peft_model_state_dict, adapter_name="defaul
         PeftType.OFT,
         PeftType.POLY,
         PeftType.LORTA,
-        PeftType.NALORTA
+        PeftType.NALORTA,
+        PeftType.NARA
     ):
         if config.peft_type in (PeftType.LORTA, PeftType.NALORTA):
             # LoRTA / NA-LoRTA hold their tensor factors as flat `nn.Parameter`s on the
@@ -230,6 +238,25 @@ def set_peft_model_state_dict(model, peft_model_state_dict, adapter_name="defaul
             # leaving a freshly initialised adapter whose `lora_B` is zero, i.e. the bare
             # base model.
             peft_model_state_dict = state_dict
+        elif config.peft_type == PeftType.NARA:
+            # NaRA is a hybrid of the two shapes above and needs both treatments. Its
+            # per-layer factors live in the usual per-adapter ModuleDicts, so their saved
+            # keys had `.default` stripped and must have it put back; its shared mapper and
+            # lambda embedding are flat modules on the base model (`...lora_mapper.*`,
+            # `...lora_phi`, `...lora_constant_c`) whose keys are already correct and would
+            # be mangled by the same rewrite. Getting either half wrong fails silently, in
+            # the way described above: `strict=False` drops the unmatched keys and you are
+            # left with a zero-`B` adapter, i.e. the bare base model, with no error.
+            peft_model_state_dict = {}
+            for k, v in state_dict.items():
+                if _NARA_PER_LAYER_KEY.search(k):
+                    suffix = k.split("lora_")[1]
+                    if "." in suffix:
+                        suffix_to_replace = ".".join(suffix.split(".")[1:])
+                        k = k.replace(suffix_to_replace, f"{adapter_name}.{suffix_to_replace}")
+                    else:
+                        k = f"{k}.{adapter_name}"
+                peft_model_state_dict[k] = v
         else:
             peft_model_state_dict = {}
             parameter_prefix = {

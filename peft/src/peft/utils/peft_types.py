@@ -31,6 +31,7 @@ class PeftType(str, enum.Enum):
     - LORA
     - LORTA
     - NALORTA
+    - NARA
     - ADALORA
     - ADAPTION_PROMPT
     - IA3
@@ -53,6 +54,7 @@ class PeftType(str, enum.Enum):
     POLY = "POLY"
     LORTA = "LORTA"
     NALORTA = "NALORTA"
+    NARA = "NARA"
 
 
 class TaskType(str, enum.Enum):

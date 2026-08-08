@@ -24,7 +24,7 @@ from peft.utils import PeftType
 @dataclass
 class LoftQConfig:
     """
-    This is the sub-configuration class to store the configuration of a [`LoraModel`].
+    This is the sub-configuration class to store the configuration of a [`NARAModel`].
 
     Args:
         bits_pattern (`dict`): The mapping from layer names or regexp expression to bits which are different from the
@@ -41,13 +41,41 @@ class LoftQConfig:
 
 
 @dataclass
-class NALorTaConfig(PeftConfig):
+class NARAConfig(PeftConfig):
     """
-    This is the configuration class to store the configuration of a [`LoraModel`].
+    Configuration for NaRA (Noise-aware Rank Adaptation).
+
+    NaRA is LoRA with a noise-conditioned mixing matrix inserted between the two factors:
+
+        h(x) = W_0 x + B . C(lambda) . A x . scaling
+        C(lambda) = I_r + c_scale * F_phi(e(lambda))     # F_phi output reshaped to r x r
+
+    `A` and `B` are ordinary per-layer LoRA factors. `F_phi` is one small MLP shared by
+    every adapted matrix in every layer, so `C` is computed once per forward and broadcast.
+    Its output layer is zero-initialised (`init_c="zero_last"`), so `C == I_r` at step 0
+    and an untrained NaRA adapter is numerically identical to plain LoRA.
+
+    **What lambda is.** The masked proportion of the *answer*: masked answer tokens over
+    answer tokens. Its denominator is not recoverable from `input_ids` (the response holds
+    unmasked tokens too), so the caller passes a `response_mask` kwarg to the forward;
+    PEFT strips it before the base model is called. See `lambda_source`.
+
+    **Scaling convention.** The delta is scaled by `lora_alpha / r` (PEFT's convention,
+    shared with `lora`/`lorta`/`nalorta` so the four are comparable under one sweep),
+    times `scale_ab`. The reference implementation instead scales by `scale_ab` alone and
+    leaves `lora_alpha` unused, so its reported learning rates do not transfer: to
+    reproduce upstream numerics exactly, set `lora_alpha = r`. Expect to sweep the
+    learning rate rather than trusting either repo's number.
+
+    **Batching.** `C` is computed per example (`[batch, r, r]`) by default, because rows
+    of a training batch genuinely carry different masking probabilities. `pool_lambda=True`
+    selects the cheaper single-`C`-per-batch behaviour, which is exact only when every row
+    has the same lambda.
 
     Args:
         r (`int`):
-            Lora attention dimension (the "rank").
+            Lora attention dimension (the "rank"). Written `r_ab` in the reference
+            implementation; `C` is `r x r`, so the mapper's output layer grows as `r^2`.
         target_modules (`Optional[Union[List[str], str]]`):
             The names of the modules to apply the adapter to. If this is specified, only the modules with the specified
             names will be replaced. When passing a string, a regex match will be performed. When passing a list of
@@ -112,6 +140,51 @@ class NALorTaConfig(PeftConfig):
             Build a new stack of layers by stacking the original model layers according to the ranges specified. This
             allows expanding (or shrinking) the model without duplicating the base model weights. The new layers will
             all have separate LoRA adapters attached to them.
+
+    NaRA-specific args:
+        c_scale (`float`):
+            Weight on the mapper's contribution: `C = I_r + c_scale * F_phi(e(lambda))`. The
+            reference configs use `0.1`.
+        scale_ab (`float`):
+            Extra multiplier on the delta, on top of PEFT's `lora_alpha / r`. Defaults to `1.0`.
+        init_c (`str`):
+            Mapper initialisation. `"zero_last"` (default) zeroes only the output layer, so
+            `C == I_r` and the adapter starts identical to LoRA. `"kaiming_uniform_m"` and
+            `"zero_all"` are the reference's other options and give up that property.
+        fnn_hidden_size_1 / fnn_hidden_size_2 (`int`):
+            Widths of the mapper's two hidden layers (reference: 256, 512).
+        embedding_type (`str`):
+            How the scalar lambda is embedded before the mapper: `"fourier"` (default, frozen
+            Gaussian Fourier features), `"mlp"` (learnable) or `"raw"` (the scalar itself).
+        embedding_dim (`int`):
+            Width of that embedding; ignored for `"raw"`, and must be even for `"fourier"`.
+        input_mode (`str`):
+            `"nl"` (default) conditions on the noise level lambda. `"constant"` replaces the
+            mapper with a single learnable `r x r` parameter -- a useful ablation that isolates
+            "an extra `r x r` factor" from "an extra `r x r` factor that *knows the noise
+            level*". `"nd"` and `"both"` (local mask density) are not implemented yet.
+        lambda_source (`str`):
+            Denominator of lambda. `"response"` (default) divides by the answer tokens and
+            requires a `response_mask` kwarg on the forward. `"non_padding"` divides by every
+            non-padding token, prompt included; it is offered only for comparison against
+            NA-LoRTA's original behaviour, and caps lambda below 1.0 by a per-example factor.
+            Note the reference implementation trains on the *sampled* masking probability and
+            evaluates on the realised response-only fraction; this port uses the realised
+            answer fraction at both ends, on purpose.
+        pool_lambda (`bool`):
+            Pool lambda to one scalar over the batch, giving a single `[r, r]` `C`, instead of
+            the default per-example `[batch, r, r]`. Cheaper, and exact only when every row
+            shares a lambda.
+        train_a / train_b / train_mapper (`bool`):
+            Ablation switches; each freezes the corresponding parameters.
+        mapper_groups (`Optional[Dict[str, List[str]]]`):
+            Per-group mappers. Not implemented yet; setting it raises.
+        training_stage (`int`):
+            Reference two-stage schedule (stage 1 freezes the mapper at `C == I`). Not
+            implemented yet; only `2` is accepted.
+        density_radius (`Optional[int]`):
+            Window radius for the local mask density used by `input_mode="nd"/"both"`. Not
+            implemented yet.
     """
 
     r: int = field(default=8, metadata={"help": "Lora attention dimension"})
@@ -128,30 +201,78 @@ class NALorTaConfig(PeftConfig):
         },
     )
     lora_alpha: int = field(default=8, metadata={"help": "Lora alpha"})
-    init_scale: float = field(default=0.0, metadata={"help": "Initial scale for NALoRTA"})
-    embedding_length: int = field(
-        default=32, metadata={"help": "Length of the embedding dimension for the Theta tensor factor"}
+
+    # --- NaRA: the noise-conditioned mixing matrix C ---
+    c_scale: float = field(
+        default=1.0, metadata={"help": "Weight on the mapper term in `C = I_r + c_scale * F_phi(e(lambda))`"}
     )
-    eta: float = field(
+    scale_ab: float = field(
         default=1.0,
         metadata={
-            "help": "Scale (eta) on the mask-proportion modulation term `eta * Theta^T phi(mask_proportion)` "
-            "that is added to the rank identity when computing the NALoRTA weights."
+            "help": "Extra multiplier on the delta, on top of PEFT's `lora_alpha / r`. Set `lora_alpha = r` "
+            "to reproduce the reference implementation, which scales by `scale_ab` alone."
+        },
+    )
+    init_c: Literal["zero_last", "kaiming_uniform_m", "zero_all"] = field(
+        default="zero_last",
+        metadata={
+            "help": "Mapper init. 'zero_last' zeroes only the output layer so C == I_r and NaRA starts "
+            "numerically identical to LoRA."
+        },
+    )
+    fnn_hidden_size_1: int = field(default=256, metadata={"help": "Width of the mapper's first hidden layer"})
+    fnn_hidden_size_2: int = field(default=512, metadata={"help": "Width of the mapper's second hidden layer"})
+
+    # --- NaRA: how lambda is embedded ---
+    embedding_type: Literal["fourier", "mlp", "raw"] = field(
+        default="fourier", metadata={"help": "Scalar embedding of lambda: 'fourier' (frozen), 'mlp', or 'raw'"}
+    )
+    embedding_dim: int = field(
+        default=64,
+        metadata={"help": "Width of the lambda embedding; must be even for 'fourier', ignored for 'raw'"},
+    )
+
+    # --- NaRA: what the adapter is conditioned on ---
+    input_mode: Literal["nl", "constant", "nd", "both"] = field(
+        default="nl",
+        metadata={
+            "help": "'nl' conditions on the noise level; 'constant' uses a learnable r x r parameter with no "
+            "noise input (ablation baseline). 'nd'/'both' (local mask density) are not implemented."
         },
     )
     lambda_source: Literal["response", "non_padding"] = field(
         default="response",
         metadata={
-            "help": (
-                "Denominator of the mask proportion the adapter is conditioned on. 'response' (default) "
-                "divides by the answer tokens only and requires the caller to pass a `response_mask` "
-                "kwarg to the forward. 'non_padding' divides by every non-padding token, prompt included; "
-                "that is the pre-`response_mask` behaviour and is kept only so earlier runs remain "
-                "reproducible -- it caps the proportion below 1.0 by a per-example, prompt-length-dependent "
-                "factor and shifts between training and generation."
-            )
+            "help": "Denominator of lambda. 'response' divides by the answer tokens and needs a `response_mask` "
+            "kwarg on the forward; 'non_padding' divides by every non-padding token, prompt included."
         },
     )
+    pool_lambda: bool = field(
+        default=False,
+        metadata={
+            "help": "Pool lambda to one scalar over the batch (single [r, r] C) instead of the default "
+            "per-example [batch, r, r]. Exact only when every row shares a lambda."
+        },
+    )
+
+    # --- NaRA: ablation switches ---
+    train_a: bool = field(default=True, metadata={"help": "Train the per-layer A factors"})
+    train_b: bool = field(default=True, metadata={"help": "Train the per-layer B factors"})
+    train_mapper: bool = field(
+        default=True, metadata={"help": "Train the shared mapper (and the learnable parts of the embedding)"}
+    )
+
+    # --- NaRA: declared but not implemented (phase 2); present so adding them stays additive ---
+    mapper_groups: Optional[dict[str, list[str]]] = field(
+        default=None, metadata={"help": "Per-group mappers. Not implemented yet."}
+    )
+    training_stage: int = field(
+        default=2, metadata={"help": "Reference two-stage schedule. Not implemented yet; only 2 is accepted."}
+    )
+    density_radius: Optional[int] = field(
+        default=None, metadata={"help": "Window radius for local mask density. Not implemented yet."}
+    )
+
     lora_dropout: float = field(default=0.0, metadata={"help": "Lora dropout"})
     fan_in_fan_out: bool = field(
         default=False,
@@ -293,15 +414,8 @@ class NALorTaConfig(PeftConfig):
         },
     )
 
-    @property
-    def is_prompt_learning(self) -> bool:
-        r"""
-        Utility method to check if the configuration is for prompt learning.
-        """
-        return False  # True
-
     def __post_init__(self):
-        self.peft_type = PeftType.NALORTA
+        self.peft_type = PeftType.NARA
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )
@@ -328,3 +442,26 @@ class NALorTaConfig(PeftConfig):
         # convert loftq_config to dict
         if self.loftq_config and not isinstance(self.loftq_config, dict):
             self.loftq_config = vars(self.loftq_config)
+
+        # --- NaRA-specific validation ---
+        if self.input_mode not in ("nl", "constant"):
+            raise NotImplementedError(
+                f"`input_mode={self.input_mode!r}` needs the local mask density, which is not implemented yet. "
+                "Use 'nl' (noise level) or 'constant'."
+            )
+        if self.mapper_groups is not None:
+            raise NotImplementedError("`mapper_groups` (per-group mappers) is not implemented yet.")
+        if self.training_stage != 2:
+            raise NotImplementedError(
+                f"`training_stage={self.training_stage}` is not implemented yet; only stage 2 (the full method) "
+                "is available. A stage-1 warm-up is equivalent to freezing the mapper from the training script."
+            )
+        if self.density_radius is not None:
+            raise NotImplementedError("`density_radius` only applies to the unimplemented 'nd'/'both' input modes.")
+        if self.use_dora:
+            raise NotImplementedError("NaRA does not support DoRA.")
+        if self.embedding_type == "fourier" and self.embedding_dim % 2 != 0:
+            raise ValueError(
+                f"`embedding_dim` must be even for `embedding_type='fourier'` (got {self.embedding_dim}); "
+                "the embedding concatenates sin and cos to reach the requested width."
+            )
