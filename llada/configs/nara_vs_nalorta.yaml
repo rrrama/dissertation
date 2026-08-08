@@ -15,7 +15,7 @@
 
 model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
 tuning_type: ["nalorta", "nara"]
-rank: 128
+rank: 32
 lora_alpha: 4
 
 data_name: "gsm8k"
