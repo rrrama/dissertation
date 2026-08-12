@@ -30,6 +30,13 @@ import wandb
 
 IGNORE_INDEX = -100
 
+# `tuning_type` value for the untuned baseline: no adapter at all, so the
+# benchmark scores the bare base model. It is a benchmark-only pseudo-adapter --
+# there is nothing to train, and no adapter is written to (or read from) the run
+# directory. Putting it in a sweep (`tuning_type: ["none", "nara", ...]`) gives
+# every other run a reference point under identical decoding settings.
+NO_ADAPTER = "none"
+
 
 @dataclass
 class ModelArguments:
@@ -57,7 +64,11 @@ class ModelArguments:
     )
     tuning_type: str = field(
         default="lorta",
-        metadata={"help": "Adapter to train: 'lora', 'lorta', 'nalorta' or 'nara'."},
+        metadata={
+            "help": "Adapter to train: 'lora', 'lorta', 'nalorta' or 'nara'. "
+            "'none' is the untuned-baseline pseudo-adapter: benchmark-only, it "
+            "scores the bare base model (see NO_ADAPTER)."
+        },
     )
 
 
@@ -543,6 +554,14 @@ def _build_peft_config(model_args):
     """Return the adapter config for the selected `tuning_type`."""
     # LLaDA target modules: q_proj / k_proj / v_proj / attn_out (no o_proj).
     llada_target_modules = ["q_proj", "k_proj", "v_proj", "attn_out"]
+    if model_args.tuning_type == NO_ADAPTER:
+        raise ValueError(
+            f"tuning_type '{NO_ADAPTER}' is the untuned baseline and has nothing to "
+            "train: it exists only for `--mode benchmark`, which scores the base "
+            "model directly. Drop it from this config, or run the sweep with "
+            "`batch_train.py --mode benchmark` / `--mode all` (both skip training "
+            "for baseline runs)."
+        )
     if model_args.tuning_type == "lora":
         from peft import LoraConfig
 
@@ -689,9 +708,24 @@ def run_training(config: Dict, output_dir: str):
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
-    # No evaluation here: diffusion sampling is expensive and single-GPU, so it
-    # is a separate job (`--mode benchmark`) run against the saved adapter.
+    # Nothing in the loss guards against divergence (the masking probability is
+    # floored at `diffusion_eps` and the answer-length denominator is clamped, so
+    # the objective itself cannot produce NaN -- only the weights can), and a
+    # diverged adapter is indistinguishable from a good one until something looks
+    # at the numbers. Read the file back on the main process: a fraction of a second
+    # here, against ~20 h of benchmark decoding on an adapter that is all NaN. Only
+    # rank 0 wrote it and so only rank 0 checks; torchrun tears down the other ranks
+    # when this one exits non-zero.
+    #
+    # No evaluation here either: diffusion sampling is expensive and single-GPU, so
+    # it is a separate job (`--mode benchmark`) run against the saved adapter.
     if is_main_process:
+        from peft import load_peft_weights
+
+        _assert_adapter_finite(
+            load_peft_weights(training_args.output_dir, device="cpu"),
+            training_args.output_dir,
+        )
         print(f"Training finished; adapter saved to {training_args.output_dir}")
         wandb.finish()
 
@@ -713,6 +747,30 @@ def _write_benchmark_result(output_dir: str, result: Dict):
     print(f"Wrote benchmark result -> {path}")
 
 
+def _examples(keys, n=5):
+    """A few key names for an error message, rather than all 262 of them."""
+    shown = ", ".join(sorted(keys)[:n])
+    return f"{shown}, ... ({len(keys)} total)" if len(keys) > n else shown
+
+
+def _assert_adapter_finite(state_dict, adapter_dir):
+    """Reject an adapter whose weights diverged during training.
+
+    A NaN adapter loads perfectly happily and then decodes 1319 GSM8K questions into
+    garbage over ~20 h, so it is worth a fraction of a second to refuse it here. It is
+    also checked *before* `_assert_adapter_loaded`, because NaN != NaN: a correctly
+    loaded NaN tensor fails that function's `allclose` against the very file it came
+    from, and gets reported as a loading bug that isn't there.
+    """
+    corrupt = [key for key, value in state_dict.items() if not torch.isfinite(value).all()]
+    if corrupt:
+        raise RuntimeError(
+            f"{len(corrupt)}/{len(state_dict)} adapter tensor(s) in {adapter_dir} are "
+            f"non-finite ({_examples(corrupt)}). The training run diverged -- this is a "
+            "training problem, not a loading one; lower the learning rate and retrain."
+        )
+
+
 def _assert_adapter_loaded(model, adapter_dir):
     """Fail loudly if the saved adapter tensors did not land in the model.
 
@@ -727,6 +785,9 @@ def _assert_adapter_loaded(model, adapter_dir):
     from peft.utils import get_peft_model_state_dict
 
     saved = load_peft_weights(adapter_dir, device="cpu")
+    # Non-finite weights would be reported below as "present but not equal", i.e. as
+    # this function's failure mode rather than their own; rule them out first.
+    _assert_adapter_finite(saved, adapter_dir)
     # `get_peft_model_state_dict` is what wrote the file, so it names tensors the
     # same way on the way back out -- for LoRA (per-adapter ModuleDicts) as well as
     # for LoRTA (flat parameters). Comparing through it keeps this check agnostic
@@ -745,15 +806,17 @@ def _assert_adapter_loaded(model, adapter_dir):
     if missing or mismatched:
         raise RuntimeError(
             f"Adapter in {adapter_dir} was not loaded into the model: "
-            f"{len(missing)} key(s) absent from the model ({missing}), "
+            f"{len(missing)} key(s) absent from the model ({_examples(missing)}), "
             f"{len(mismatched)} key(s) present but not equal to the saved tensor "
-            f"({mismatched}). Benchmarking would score the base model instead."
+            f"({_examples(mismatched)}). Benchmarking would score the base model instead."
         )
 
 
 def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
     """Load base model + trained adapter and score GSM8K test accuracy."""
     from peft import PeftModel
+
+    is_baseline = model_args.tuning_type == NO_ADAPTER
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -762,9 +825,14 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         token=model_args.token,
         trust_remote_code=True,
     )
-    model = PeftModel.from_pretrained(model, adapter_dir)
-    # Checked on the CPU model, before the .to(device) below, so it is cheap.
-    _assert_adapter_loaded(model, adapter_dir)
+    if is_baseline:
+        # No adapter to load, and nothing for `_assert_adapter_loaded` to check:
+        # the base model *is* the thing being benchmarked here, not an accident.
+        print(f"tuning_type='{NO_ADAPTER}': benchmarking the base model, no adapter")
+    else:
+        model = PeftModel.from_pretrained(model, adapter_dir)
+        # Checked on the CPU model, before the .to(device) below, so it is cheap.
+        _assert_adapter_loaded(model, adapter_dir)
     # `training_args.device` is this rank's own GPU (cuda:LOCAL_RANK under
     # torchrun); "cuda" would pile every rank onto cuda:0. No DDP wrapper: this
     # is pure inference, the ranks only talk to each other at the final gather.
@@ -778,9 +846,11 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
     accuracy, ans_pred_list, answers = diffusion_evaluate(
         model, tokenizer, test_set, training_args
     )
-    print(f"adapter: {adapter_dir} | GSM8K test accuracy: {100*accuracy:.2f}%")
+    label = "base model (no adapter)" if is_baseline else f"adapter: {adapter_dir}"
+    print(f"{label} | GSM8K test accuracy: {100*accuracy:.2f}%")
     return {
         "benchmark": "gsm8k_accuracy",
+        "tuning_type": model_args.tuning_type,
         "accuracy": accuracy,
         "num_examples": len(answers),
         "predictions": ans_pred_list,
@@ -805,12 +875,15 @@ def run_benchmark(config: Dict, output_dir: str):
             f"Unknown benchmark '{bench_name}'. Registered: {sorted(BENCHMARKS)}"
         )
 
-    adapter_config = os.path.join(output_dir, "adapter_config.json")
-    if not os.path.exists(adapter_config):
-        raise FileNotFoundError(
-            f"No trained adapter found in {output_dir} (missing adapter_config.json). "
-            "Train this run before benchmarking."
-        )
+    # The baseline run has no adapter by construction, so the existence check
+    # below would reject exactly the run it is meant to protect.
+    if config.get("tuning_type") != NO_ADAPTER:
+        adapter_config = os.path.join(output_dir, "adapter_config.json")
+        if not os.path.exists(adapter_config):
+            raise FileNotFoundError(
+                f"No trained adapter found in {output_dir} (missing adapter_config.json). "
+                "Train this run before benchmarking."
+            )
 
     model_args, data_args, training_args = build_args(config)
     training_args.output_dir = output_dir

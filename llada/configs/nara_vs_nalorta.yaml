@@ -10,17 +10,28 @@
 # NaRA's own LLaDA config uses lr 1e-4, but it scales its delta by `scale_ab`
 # alone and ignores `lora_alpha`, whereas this port uses PEFT's `lora_alpha / r`
 # so the two adapters share a scaling convention. That makes neither repo's
-# learning rate transferable -- expect to sweep it. The value below is the one
-# `lorta_vs_nalorta.yaml` uses, i.e. a starting point, not a tuned number.
+# learning rate transferable -- expect to sweep it.
+#
+# The first attempt at this sweep inherited `lorta_vs_nalorta.yaml`'s lr of 0.05
+# and NaRA diverged: every trained tensor in the saved adapter was NaN (262 of the
+# 263 checkpoint entries; only the frozen Fourier projection, which no gradient
+# reaches, survived), which surfaced as a benchmark-time failure a day later.
+# NaRA is the more fragile of the two arms by construction -- `lora_mapper`'s
+# output layer is zero-initialised, so nothing anchors its scale, and it feeds
+# `C(lambda)` into all 128 adapted matrices at once, so one oversized step there
+# overflows bf16 everywhere simultaneously. Both arms moved to NaRA's reference
+# 1e-4 rather than NaRA alone: a per-arm learning rate would confound the
+# comparison this file exists to make. That does mean the numbers here are not
+# comparable to the 0.05 runs in `lorta_vs_nalorta.yaml`.
 
 model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
-tuning_type: ["nalorta", "nara"]
+tuning_type: ["nalorta", "nara", "none"]
 rank: 32
 lora_alpha: 4
 
 data_name: "gsm8k"
 
-learning_rate: 0.05
+learning_rate: 0.0001
 num_train_epochs: 6
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 10

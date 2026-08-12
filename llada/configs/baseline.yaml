@@ -1,0 +1,39 @@
+# Untuned baseline: score the bare LLaDA-8B-Instruct on GSM8K with no adapter.
+#
+#   python batch_train.py --mode benchmark --config configs/baseline.yaml
+#
+# There is nothing to train, so `--mode benchmark` is the whole job (`--mode all`
+# works too and submits the same single benchmark). Results land in
+# outputs/baseline/none/benchmark.json.
+#
+# `tuning_type` is a one-element *list* purely for naming: a scalar leaves the
+# run with no varying field and it gets called `run_000`, whereas the list names
+# the directory `none`.
+#
+# Every decoding setting below is copied from nara_vs_nalorta.yaml so the number
+# is directly comparable to the adapters in that sweep. Training hyperparameters
+# are omitted -- no training happens.
+
+model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+tuning_type: ["none"]
+
+data_name: "gsm8k"
+seed: 42
+model_max_length: 512
+
+expt_name: "llada_gsm8k_baseline"
+wandb_project: "llada_gsm8k_training"
+report_to: "wandb"
+
+mask_id: 126336
+gen_length: 256
+diffusion_steps: 256
+block_length: 256
+remasking: "low_confidence"
+gen_temperature: 0.0
+benchmark_batch_size: 8
+
+nproc_per_node: 3
+gres: "gpu:lovelace_l40:3"
+
+benchmark: "gsm8k_accuracy"

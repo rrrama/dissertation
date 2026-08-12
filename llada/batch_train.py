@@ -25,6 +25,12 @@ Re-running a config in train mode is safe: runs that already have a saved
 adapter are skipped, so only the missing points of a sweep are submitted. Pass
 ``--overwrite`` to retrain (and clobber) finished runs.
 
+``tuning_type: none`` marks an untuned-baseline run: no adapter, nothing to
+train, benchmark only (train mode materialises its run directory and submits
+nothing; ``all``/``benchmark`` submit its benchmark with no dependency). Listing
+it alongside real adapters -- ``tuning_type: ["none", "nara"]`` -- puts the base
+model's score in the same ``summary.json`` under identical decoding settings.
+
 Usage:
     python batch_train.py --mode train      --config configs/run001_baseline.yaml
     python batch_train.py --mode benchmark  --config configs/run001_baseline.yaml
@@ -51,6 +57,12 @@ LLADA_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(LLADA_DIR)
 PEFT_DIR = os.path.join(REPO_DIR, "peft")
 OUTPUTS_ROOT = os.path.join(LLADA_DIR, "outputs")
+
+# `tuning_type` value marking an untuned-baseline run: no adapter, benchmark
+# only. Kept in sync with train.py's NO_ADAPTER by hand rather than imported --
+# this module deliberately avoids importing train.py (and hence torch) so it can
+# run on a login node.
+NO_ADAPTER = "none"
 
 # Keys that configure the batch/slurm layer rather than the training run. They
 # are still written into the frozen config (harmless -- train.py ignores keys it
@@ -292,9 +304,23 @@ def submit(sbatch_path, no_submit, after_job=None):
 # --------------------------------------------------------------------------- #
 
 
+def _is_baseline(run_cfg):
+    """True for the untuned baseline run (`tuning_type: none`) -- see NO_ADAPTER."""
+    return run_cfg.get("tuning_type") == NO_ADAPTER
+
+
 def _is_trained(run_dir):
     """A run counts as trained once train.py has saved an adapter into it."""
     return os.path.exists(os.path.join(run_dir, "adapter_config.json"))
+
+
+def _is_benchmarkable(run_cfg, run_dir):
+    """Can this run be benchmarked now?
+
+    A baseline run always can: it has no adapter to wait for. Everything else
+    needs train.py to have saved one.
+    """
+    return _is_baseline(run_cfg) or _is_trained(run_dir)
 
 
 def _prepare_run_dir(exp_dir, name):
@@ -311,6 +337,15 @@ def _freeze_config(run_cfg, run_dir):
     with open(config_path, "w") as f:
         yaml.safe_dump(run_cfg, f, sort_keys=True, default_flow_style=False)
     return config_path
+
+
+def _materialise_run(exp_dir, name, run_cfg, varying):
+    """Create the run directory and write its frozen config + metadata."""
+    run_dir, log_dir = _prepare_run_dir(exp_dir, name)
+    config_path = _freeze_config(run_cfg, run_dir)
+    with open(os.path.join(run_dir, "metadata.json"), "w") as f:
+        json.dump(build_metadata(run_cfg, varying), f, indent=2)
+    return run_dir, log_dir, config_path
 
 
 def write_summary(exp_dir, runs_info, mode):
@@ -356,6 +391,7 @@ def run_train_mode(config, config_name, no_submit, overwrite):
     print(f"Expanded to {len(runs)} run(s) under {exp_dir}")
     runs_info = []
     skipped = []
+    baselines = []
     for idx, ((run_cfg, varying), name) in enumerate(zip(runs, names)):
         run_dir = os.path.join(exp_dir, name)
         # A finished run leaves an adapter behind. Re-submitting would clobber
@@ -365,10 +401,17 @@ def run_train_mode(config, config_name, no_submit, overwrite):
             runs_info.append({"name": name, "run_dir": run_dir, "varying": varying})
             continue
 
-        run_dir, log_dir = _prepare_run_dir(exp_dir, name)
-        config_path = _freeze_config(run_cfg, run_dir)
-        with open(os.path.join(run_dir, "metadata.json"), "w") as f:
-            json.dump(build_metadata(run_cfg, varying), f, indent=2)
+        if _is_baseline(run_cfg):
+            # Nothing to train, but still materialise the run dir: `--mode
+            # benchmark` reads the frozen config.yaml from it.
+            run_dir, _, _ = _materialise_run(exp_dir, name, run_cfg, varying)
+            baselines.append(name)
+            runs_info.append({"name": name, "run_dir": run_dir, "varying": varying})
+            continue
+
+        run_dir, log_dir, config_path = _materialise_run(
+            exp_dir, name, run_cfg, varying
+        )
 
         print(f"[{idx + 1}/{len(runs)}] {name}")
         sbatch_path = write_sbatch(
@@ -381,6 +424,12 @@ def run_train_mode(config, config_name, no_submit, overwrite):
         print(
             f"[skip] {len(skipped)}/{len(runs)} run(s) already trained; pass "
             f"--overwrite to retrain them: {', '.join(skipped)}"
+        )
+    if baselines:
+        print(
+            f"[baseline] {len(baselines)}/{len(runs)} run(s) have "
+            f"tuning_type: {NO_ADAPTER} and need no training; benchmark them with "
+            f"--mode benchmark: {', '.join(baselines)}"
         )
 
     write_summary(exp_dir, runs_info, "train")
@@ -406,7 +455,15 @@ def run_all_mode(config, config_name, no_submit, overwrite):
         info = {"name": name, "run_dir": run_dir, "varying": varying}
         print(f"[{idx + 1}/{len(runs)}] {name}")
 
-        if _is_trained(run_dir) and not overwrite:
+        if _is_baseline(run_cfg):
+            # No adapter to train, so the benchmark is unconditional -- no
+            # dependency, and `--overwrite` has nothing to redo.
+            print(f"  [baseline] tuning_type: {NO_ADAPTER}; benchmarking base model")
+            run_dir, log_dir, config_path = _materialise_run(
+                exp_dir, name, run_cfg, varying
+            )
+            train_job = None
+        elif _is_trained(run_dir) and not overwrite:
             # Adapter already on disk: nothing to train, so the benchmark goes
             # straight onto the queue with no dependency.
             reused.append(name)
@@ -415,10 +472,9 @@ def run_all_mode(config, config_name, no_submit, overwrite):
             config_path = os.path.join(run_dir, "config.yaml")
             train_job = None
         else:
-            run_dir, log_dir = _prepare_run_dir(exp_dir, name)
-            config_path = _freeze_config(run_cfg, run_dir)
-            with open(os.path.join(run_dir, "metadata.json"), "w") as f:
-                json.dump(build_metadata(run_cfg, varying), f, indent=2)
+            run_dir, log_dir, config_path = _materialise_run(
+                exp_dir, name, run_cfg, varying
+            )
             train_sbatch = write_sbatch(
                 "train", run_cfg, config_name, name, config_path, run_dir, log_dir
             )
@@ -473,8 +529,8 @@ def run_benchmark_mode(config, config_name, no_submit):
     missing = []
     for (run_cfg, varying), name in zip(runs, names):
         run_dir = os.path.join(exp_dir, name)
-        trained = _is_trained(run_dir)
-        if not trained:
+        ready = _is_benchmarkable(run_cfg, run_dir)
+        if not ready:
             missing.append(name)
         runs_info.append(
             {
@@ -482,7 +538,7 @@ def run_benchmark_mode(config, config_name, no_submit):
                 "run_dir": run_dir,
                 "varying": varying,
                 "run_cfg": run_cfg,
-                "trained": trained,
+                "ready": ready,
             }
         )
 
@@ -493,13 +549,23 @@ def run_benchmark_mode(config, config_name, no_submit):
         )
 
     for idx, info in enumerate(runs_info):
-        if not info["trained"]:
+        if not info["ready"]:
             continue
         run_dir = info["run_dir"]
-        log_dir = os.path.join(run_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        config_path = os.path.join(run_dir, "config.yaml")
         print(f"[{idx + 1}/{len(runs)}] {info['name']}")
+        if _is_baseline(info["run_cfg"]):
+            # A baseline run may never have been through train mode, so its run
+            # dir and frozen config might not exist yet. Writing them here is
+            # idempotent and keeps `--mode benchmark` usable on its own.
+            print(f"  [baseline] tuning_type: {NO_ADAPTER}; benchmarking base model")
+            run_dir, log_dir, config_path = _materialise_run(
+                exp_dir, info["name"], info["run_cfg"], info["varying"]
+            )
+            info["run_dir"] = run_dir
+        else:
+            log_dir = os.path.join(run_dir, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            config_path = os.path.join(run_dir, "config.yaml")
         sbatch_path = write_sbatch(
             "benchmark",
             info["run_cfg"],
