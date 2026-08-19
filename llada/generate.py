@@ -156,13 +156,19 @@ def generate(
 
     # The response region is always the trailing `gen_length` columns, so the mask the
     # noise-aware adapters need for their lambda denominator is a constant of the layout.
-    # PEFT strips `response_mask` before LLaDA is called, so passing it is safe for every
-    # tuning type (see `peft_model.PeftModel.special_peft_forward_args`).
-    response_mask = torch.zeros(
-        (batch_size, prompt_len + gen_length), dtype=torch.bool, device=device
-    )
-    response_mask[:, prompt_len:] = True
-    model_kwargs = {"response_mask": response_mask}
+    # A PeftModel forwards it to the tuner and strips it before LLaDA is called, so it is
+    # safe for every tuning type -- but only for a PeftModel. The untuned baseline
+    # (`tuning_type: "none"`) hands us the bare LLaDA model, whose `forward` has no
+    # `response_mask` parameter and would raise a TypeError, so ask the model whether it
+    # strips the kwarg (see `peft_model.PeftModel.special_peft_forward_args`) instead of
+    # assuming it does.
+    model_kwargs = {}
+    if "response_mask" in getattr(model, "special_peft_forward_args", ()):
+        response_mask = torch.zeros(
+            (batch_size, prompt_len + gen_length), dtype=torch.bool, device=device
+        )
+        response_mask[:, prompt_len:] = True
+        model_kwargs["response_mask"] = response_mask
 
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)

@@ -833,6 +833,19 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         model = PeftModel.from_pretrained(model, adapter_dir)
         # Checked on the CPU model, before the .to(device) below, so it is cheap.
         _assert_adapter_loaded(model, adapter_dir)
+        # `generate()` only passes `response_mask` to a model that advertises it will
+        # strip it again (the bare base model's forward would raise a TypeError). If
+        # that ever stops being true for an adapted model -- a wrapper hiding the
+        # attribute, say -- the noise-aware tuners would not raise: they warn once and
+        # silently fall back to a prompt+answer lambda denominator, i.e. quietly
+        # benchmark a differently-conditioned adapter. Fail here instead.
+        if "response_mask" not in getattr(model, "special_peft_forward_args", ()):
+            raise RuntimeError(
+                f"{type(model).__name__} does not declare `response_mask` in "
+                "`special_peft_forward_args`, so the sampler cannot pass it (see "
+                "generate.py). NA-LoRTA / NaRA would fall back to a prompt+answer "
+                "lambda denominator and score something other than what was trained."
+            )
     # `training_args.device` is this rank's own GPU (cuda:LOCAL_RANK under
     # torchrun); "cuda" would pile every rank onto cuda:0. No DDP wrapper: this
     # is pure inference, the ranks only talk to each other at the final gather.
