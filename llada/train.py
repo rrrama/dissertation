@@ -330,20 +330,24 @@ class LladaSFTTrainer(Trainer):
         return (loss, logits) if return_outputs else loss
 
 
-def _gather_predictions(local_indices, local_preds, total, world_size):
-    """Re-assemble the full, in-order prediction list from every rank's shard."""
-    preds = [float("inf")] * total
+def _gather_by_index(local_indices, local_values, total, world_size, fill):
+    """Re-assemble a full, in-order list from every rank's interleaved shard.
+
+    `fill` is what an index nobody produced keeps -- `inf` for a prediction (never
+    equal to a gold answer, so it scores as wrong), `""` for a completion.
+    """
+    values = [fill] * total
     if world_size <= 1 or not torch.distributed.is_initialized():
-        for i, pred in zip(local_indices, local_preds):
-            preds[i] = pred
-        return preds
+        for i, value in zip(local_indices, local_values):
+            values[i] = value
+        return values
 
     gathered = [None] * world_size
-    torch.distributed.all_gather_object(gathered, (local_indices, local_preds))
-    for indices, values in gathered:
-        for i, pred in zip(indices, values):
-            preds[i] = pred
-    return preds
+    torch.distributed.all_gather_object(gathered, (local_indices, local_values))
+    for indices, shard in gathered:
+        for i, value in zip(indices, shard):
+            values[i] = value
+    return values
 
 
 def _pad_token_id(tokenizer):
@@ -356,6 +360,34 @@ def _pad_token_id(tokenizer):
             f"tokenizer has no usable pad token for batched decoding (got {pad_id})"
         )
     return pad_id
+
+
+def _truncate_at_eos(gen_tokens, eos_token_id):
+    """Cut each response row at its first EOS -- the sampler's stand-in for stopping.
+
+    Diffusion decoding has no early exit: `generate()` fills all `gen_length`
+    positions for every question, so a model that finished its answer after 40
+    tokens still emits the remaining 216. The SFT targets end with
+    `tokenizer.eos_token` (see `SupervisedDataset`), so the model does say where it
+    meant to stop -- decoding with `skip_special_tokens=True` merely *deletes* that
+    marker instead of respecting it, which glues the trailing filler onto the answer
+    and hands `extract_answer_number`'s "last number in the string" fallback
+    (`test.py:44`) whatever number the filler happened to end on.
+
+    Rows end at different places, so the result is a list of 1-D tensors rather than
+    a rectangular batch. A row with no EOS is returned whole: the untuned baseline
+    may never emit one, and cutting it at an arbitrary point would be a guess.
+    Text-level stop sequences are the tool for that case, and picking them sensibly
+    needs a look at what the untruncated output actually contains.
+    """
+    if eos_token_id is None:
+        return list(gen_tokens)
+
+    rows = []
+    for row in gen_tokens:
+        hit = (row == eos_token_id).nonzero().flatten()
+        rows.append(row[: hit[0]] if hit.numel() else row)
+    return rows
 
 
 def _stack_prompts(prompt_ids, pad_id, device):
@@ -433,6 +465,11 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     Both are exact: every question is decoded exactly as it would be alone on one
     GPU. Batches are restricted to questions of identical prompt length, which
     eliminates padding -- see `_uniform_length_batches`.
+
+    Returns `(accuracy, predictions, gold_answers, completions)`, all four in
+    test-set order. Scoring reads each response only up to its first EOS
+    (`_truncate_at_eos`); `completions` holds the untruncated decode instead, so a
+    later scoring change can be evaluated against stored output.
     """
     model.eval()
 
@@ -468,6 +505,7 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
         )
 
     preds_by_index = {}
+    completions_by_index = {}
     progress = tqdm(
         total=len(local_indices),
         desc=f"Evaluating (diffusion) [rank {rank}]",
@@ -489,22 +527,39 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
             mask_id=training_args.mask_id,
         )
         # left padding means the response region starts at the same offset in
-        # every row of the batch
-        gen_tokens = out[:, input_ids.shape[1] :]
-        decoded_batch = tokenizer.batch_decode(gen_tokens, skip_special_tokens=True)
-        for i, decoded in zip(batch_indices, decoded_batch):
+        # every row of the batch. One host transfer for the whole batch:
+        # `_truncate_at_eos` reads positions row by row, which on the GPU would be
+        # a device sync per row.
+        gen_tokens = out[:, input_ids.shape[1] :].cpu()
+        # Kept verbatim for the record: all `gen_length` tokens, special tokens
+        # left in. That is what `_write_benchmark_result` stores, so a future
+        # scoring rule (text-level stop sequences, a different extractor) can be
+        # tried offline against these instead of re-decoding the test set. Cutting
+        # a stored completion at its first EOS marker reproduces what was scored
+        # below, up to any other special token inside the answer.
+        raw_batch = tokenizer.batch_decode(gen_tokens, skip_special_tokens=False)
+        scored_batch = [
+            tokenizer.decode(row, skip_special_tokens=True)
+            for row in _truncate_at_eos(gen_tokens, tokenizer.eos_token_id)
+        ]
+        for i, raw, decoded in zip(batch_indices, raw_batch, scored_batch):
             if rank == 0:
                 print(decoded)
             preds_by_index[i] = extract_answer_number(decoded)
+            completions_by_index[i] = raw
         progress.update(len(batch_indices))
     progress.close()
 
     local_preds = [preds_by_index[i] for i in local_indices]
-    ans_pred_list = _gather_predictions(
-        local_indices, local_preds, len(questions), world_size
+    local_completions = [completions_by_index[i] for i in local_indices]
+    ans_pred_list = _gather_by_index(
+        local_indices, local_preds, len(questions), world_size, fill=float("inf")
+    )
+    completions = _gather_by_index(
+        local_indices, local_completions, len(questions), world_size, fill=""
     )
     accuracy = compute_accuracy(answers, ans_pred_list)
-    return accuracy, ans_pred_list, answers
+    return accuracy, ans_pred_list, answers, completions
 
 
 # --------------------------------------------------------------------------- #
@@ -856,7 +911,7 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
     logging.warning("Downloading Data")
     test_set = load_dataset(data_args.data_name, "main", split="test")
 
-    accuracy, ans_pred_list, answers = diffusion_evaluate(
+    accuracy, ans_pred_list, answers, completions = diffusion_evaluate(
         model, tokenizer, test_set, training_args
     )
     label = "base model (no adapter)" if is_baseline else f"adapter: {adapter_dir}"
@@ -868,6 +923,12 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         "num_examples": len(answers),
         "predictions": ans_pred_list,
         "ground_truth": answers,
+        # Raw model output, one entry per test question, in test-set order:
+        # everything the sampler produced, special tokens included. `accuracy`
+        # above scores only the part before the first EOS, so this is the record
+        # needed to re-derive a different scoring rule (stop sequences, a changed
+        # `extract_answer_number`) without re-running the ~20 h decode.
+        "completions": completions,
         "source": "benchmark",
     }
 

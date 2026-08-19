@@ -23,7 +23,10 @@ intervention: every run trains in parallel and each benchmark starts as soon as
 
 Re-running a config in train mode is safe: runs that already have a saved
 adapter are skipped, so only the missing points of a sweep are submitted. Pass
-``--overwrite`` to retrain (and clobber) finished runs.
+``--overwrite`` to retrain (and clobber) finished runs; that also deletes each
+resubmitted run's ``benchmark.json``, so ``summary.json`` shows it as pending
+rather than reporting the superseded adapter's accuracy for the ~20 h until the
+new result lands.
 
 ``tuning_type: none`` marks an untuned-baseline run: no adapter, nothing to
 train, benchmark only (train mode materialises its run directory and submits
@@ -323,6 +326,30 @@ def _is_benchmarkable(run_cfg, run_dir):
     return _is_baseline(run_cfg) or _is_trained(run_dir)
 
 
+def _clear_stale_results(run_dir, no_submit):
+    """Drop a previous run's benchmark.json, which `--overwrite` has invalidated.
+
+    train.py only rewrites that file when a benchmark *finishes*, which is ~20 h
+    after the training job it depends on. Until then the old result sits next to
+    an adapter that is being replaced, and `write_summary` reports it as
+    `status: done` with the previous accuracy -- indefinitely, if the resubmitted
+    job never lands. Removing it up front makes the run read as `pending`, which
+    is what it is.
+
+    Not called without `--overwrite`: that is the flag that says the run's outputs
+    are expendable. A dry run (`--no-submit`) only says what it would remove.
+    """
+    bench_path = os.path.join(run_dir, "benchmark.json")
+    if not os.path.exists(bench_path):
+        return
+    rel = os.path.relpath(bench_path, LLADA_DIR)
+    if no_submit:
+        print(f"  [overwrite] would remove stale {rel}")
+        return
+    os.remove(bench_path)
+    print(f"  [overwrite] removed stale {rel}")
+
+
 def _prepare_run_dir(exp_dir, name):
     run_dir = os.path.join(exp_dir, name)
     log_dir = os.path.join(run_dir, "logs")
@@ -414,6 +441,9 @@ def run_train_mode(config, config_name, no_submit, overwrite):
         )
 
         print(f"[{idx + 1}/{len(runs)}] {name}")
+        if overwrite:
+            # The adapter this result was measured on is about to be replaced.
+            _clear_stale_results(run_dir, no_submit)
         sbatch_path = write_sbatch(
             "train", run_cfg, config_name, name, config_path, run_dir, log_dir
         )
@@ -488,6 +518,11 @@ def run_all_mode(config, config_name, no_submit, overwrite):
                 runs_info.append(info)
                 continue
 
+        if overwrite:
+            # Reachable from the baseline branch (its benchmark is unconditional)
+            # and from the retrain branch; the "reused" branch above is entered
+            # only when `overwrite` is false, so a kept adapter keeps its result.
+            _clear_stale_results(run_dir, no_submit)
         bench_sbatch = write_sbatch(
             "benchmark", run_cfg, config_name, name, config_path, run_dir, log_dir
         )
@@ -604,7 +639,8 @@ def main():
         "--overwrite",
         action="store_true",
         help=(
-            "Retrain runs that already have a saved adapter, overwriting them. "
+            "Retrain runs that already have a saved adapter, overwriting them, "
+            "and delete the benchmark.json of every run resubmitted this way. "
             "By default such runs are skipped, so re-running a config resumes "
             "an incomplete sweep instead of clobbering finished LoRTAs."
         ),
