@@ -28,7 +28,14 @@ report_to: "wandb"
 mask_id: 126336
 gen_length: 256
 diffusion_steps: 256
-block_length: 256
+# Semi-autoregressive decoding, as LLaDA's reference eval uses for the *Instruct*
+# model. With block_length == gen_length the low-confidence topk ranks all 256
+# response positions against each other, and LLaDA-Instruct is SFT'd with EOS
+# padding out to a fixed length -- so EOS in the far tail is near-certain and wins
+# the first sampling steps outright, walling off the answer before a single
+# content token is placed. 8 blocks x 32 steps is the same 256 forwards per
+# question, so this costs nothing.
+block_length: 32
 remasking: "low_confidence"
 gen_temperature: 0.0
 benchmark_batch_size: 8

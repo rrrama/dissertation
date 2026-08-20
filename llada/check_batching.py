@@ -25,7 +25,7 @@ import yaml
 from datasets import load_dataset
 
 from generate import generate
-from test import QUESTION_PROMPT
+from test import build_prompt, template_add_special_tokens
 from train import _load_tokenizer, _pad_token_id, _stack_prompts, build_args
 
 
@@ -57,9 +57,12 @@ def _decode(model, tokenizer, prompt_ids, pad_id, training_args, batch_size):
 
 def _pick_equal_length_questions(questions, tokenizer, wanted):
     """Return up to `wanted` tokenized prompts that all have the same length."""
+    add_special = template_add_special_tokens(tokenizer)
     by_length = {}
     for q in questions:
-        ids = tokenizer(q, return_tensors="pt")["input_ids"][0]
+        ids = tokenizer(q, return_tensors="pt", add_special_tokens=add_special)[
+            "input_ids"
+        ][0]
         by_length.setdefault(ids.shape[0], []).append(ids)
     length, group = max(by_length.items(), key=lambda kv: len(kv[1]))
     print(
@@ -108,7 +111,7 @@ def main():
     tokenizer = _load_tokenizer(model_args, training_args)
     test_set = load_dataset(data_args.data_name, "main", split="test")
     questions = [
-        f"{example['question']}{QUESTION_PROMPT}"
+        build_prompt(tokenizer, example["question"])
         for example in test_set.select(range(min(args.pool, len(test_set))))
     ]
     prompt_ids = _pick_equal_length_questions(questions, tokenizer, args.batch_size)

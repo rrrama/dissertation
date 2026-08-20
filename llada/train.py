@@ -24,7 +24,13 @@ from transformers import Trainer
 from tqdm import tqdm
 
 from datasets import load_dataset
-from test import extract_answer_number, compute_accuracy, ANSWER_PROMPT, QUESTION_PROMPT
+from test import (
+    ANSWER_PROMPT,
+    build_prompt,
+    compute_accuracy,
+    extract_answer_number,
+    template_add_special_tokens,
+)
 from generate import generate, MASK_ID
 import wandb
 
@@ -116,7 +122,14 @@ class TrainingArguments(transformers.TrainingArguments):
         default=256, metadata={"help": "Number of diffusion sampling steps."}
     )
     block_length: int = field(
-        default=256, metadata={"help": "Semi-autoregressive block length."}
+        default=32,
+        metadata={
+            "help": "Semi-autoregressive block length. Must divide gen_length, and "
+            "the resulting block count must divide diffusion_steps. Keep it well "
+            "below gen_length: a single full-length block lets EOS in the far tail "
+            "win the low-confidence topk and truncate the answer (see "
+            "configs/baseline.yaml)."
+        },
     )
     remasking: str = field(
         default="low_confidence", metadata={"help": "'low_confidence' or 'random'."}
@@ -136,7 +149,9 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def _tokenize_fn(
-    strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer
+    strings: Sequence[str],
+    tokenizer: transformers.PreTrainedTokenizer,
+    add_special_tokens: bool = True,
 ) -> Dict:
     """Tokenize a list of strings."""
     tokenized_list = [
@@ -146,14 +161,19 @@ def _tokenize_fn(
             padding="longest",
             max_length=tokenizer.model_max_length,
             truncation=True,
+            add_special_tokens=add_special_tokens,
         )
         for text in strings
     ]
     input_ids = [tokenized.input_ids[0] for tokenized in tokenized_list]
-    input_ids_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()
-        for tokenized in tokenized_list
-    ]
+    # Each string is tokenized on its own, so `padding="longest"` pads it to its
+    # own length -- i.e. never pads. The length therefore *is* the sequence
+    # length. Deriving it from `ne(pad_token_id)` instead would undercount any
+    # string that legitimately contains the pad token, and the chat template puts
+    # `<|eot_id|>` inside the prompt (`test.build_prompt`) -- exactly such a token
+    # on a tokenizer that pads with it. A short `source_len` leaves prompt tokens
+    # unmasked in `labels` below, i.e. silently trains on the question.
+    input_ids_lens = [ids.shape[0] for ids in input_ids]
     return dict(input_ids=input_ids, input_ids_lens=input_ids_lens)
 
 
@@ -161,6 +181,7 @@ def preprocess(
     sources: Sequence[str],
     targets: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
+    add_special_tokens: bool = True,
 ) -> Dict:
     """Preprocess the data by tokenizing.
 
@@ -169,9 +190,31 @@ def preprocess(
     """
     examples = [s + t for s, t in zip(sources, targets)]
     examples_tokenized, sources_tokenized = [
-        _tokenize_fn(strings, tokenizer) for strings in (examples, sources)
+        _tokenize_fn(strings, tokenizer, add_special_tokens)
+        for strings in (examples, sources)
     ]
     input_ids = examples_tokenized["input_ids"]
+    source_ids = sources_tokenized["input_ids"]
+
+    # Marking the prompt by *length* assumes tokenizing `source + target`
+    # reproduces tokenizing `source` as a literal prefix. BPE can merge across a
+    # concatenation boundary and break that, which shifts the mask by a token or
+    # two -- training on the tail of the question, or dropping the head of the
+    # answer out of the loss. Either way it is invisible in the loss curve, so
+    # check it rather than trust it. Truncated examples are skipped: there the
+    # prompt itself may have been cut off, and `label[:source_len]` already masks
+    # the whole (shorter) row.
+    for ids, source in zip(input_ids, source_ids):
+        if ids.shape[0] >= source.shape[0] and not torch.equal(
+            ids[: source.shape[0]], source
+        ):
+            raise ValueError(
+                "Tokenizing prompt+answer did not reproduce the prompt's own "
+                "tokenization as a prefix, so the IGNORE_INDEX label mask would "
+                "not line up with the prompt. This usually means the prompt and "
+                "the answer merge across their boundary; see test.build_prompt."
+            )
+
     labels = copy.deepcopy(input_ids)
     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
         label[:source_len] = IGNORE_INDEX
@@ -186,14 +229,18 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
 
         logging.warning("Formatting inputs...")
-        sources = [f"{example['question']}{QUESTION_PROMPT}" for example in raw_data]
+        # Same prompt format the benchmark decodes with (`test.build_prompt`), so
+        # the adapters are scored inside the format they were trained in.
+        sources = [build_prompt(tokenizer, example["question"]) for example in raw_data]
         targets = [
             f"{example['answer']}{tokenizer.eos_token}".replace("####", ANSWER_PROMPT)
             for example in raw_data
         ]
 
         logging.warning("Tokenizing inputs... This may take some time...")
-        data_dict = preprocess(sources, targets, tokenizer)
+        data_dict = preprocess(
+            sources, targets, tokenizer, template_add_special_tokens(tokenizer)
+        )
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
@@ -362,30 +409,51 @@ def _pad_token_id(tokenizer):
     return pad_id
 
 
-def _truncate_at_eos(gen_tokens, eos_token_id):
-    """Cut each response row at its first EOS -- the sampler's stand-in for stopping.
+def _stop_token_ids(tokenizer):
+    """Token ids that end a response: EOS, plus the chat template's turn marker.
+
+    The SFT targets end with `tokenizer.eos_token` (see `SupervisedDataset`), but
+    under the chat template the model's *natural* terminator is `<|eot_id|>` --
+    that is what closes an assistant turn, and it is what the untuned baseline
+    emits (followed by `<|endoftext|>` filler). Both have to count as a stop, and
+    `<|eot_id|>` especially: now that the model has been shown the multi-turn
+    format, the filler after it can be a hallucinated *next turn* rather than
+    padding, and any numbers in that turn would otherwise reach
+    `extract_answer_number`'s "last number in the string" fallback.
+    """
+    ids = set()
+    if tokenizer.eos_token_id is not None:
+        ids.add(tokenizer.eos_token_id)
+    # `convert_tokens_to_ids` returns the unk id (or None) for a token this
+    # tokenizer does not have, so neither is evidence of a real `<|eot_id|>`.
+    eot = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    if eot is not None and eot != tokenizer.unk_token_id:
+        ids.add(eot)
+    return sorted(ids)
+
+
+def _truncate_at_stop(gen_tokens, stop_ids):
+    """Cut each response row at its first stop token -- the stand-in for stopping.
 
     Diffusion decoding has no early exit: `generate()` fills all `gen_length`
     positions for every question, so a model that finished its answer after 40
-    tokens still emits the remaining 216. The SFT targets end with
-    `tokenizer.eos_token` (see `SupervisedDataset`), so the model does say where it
-    meant to stop -- decoding with `skip_special_tokens=True` merely *deletes* that
-    marker instead of respecting it, which glues the trailing filler onto the answer
-    and hands `extract_answer_number`'s "last number in the string" fallback
-    (`test.py:44`) whatever number the filler happened to end on.
+    tokens still emits the remaining 216. The model does say where it meant to
+    stop -- decoding with `skip_special_tokens=True` merely *deletes* that marker
+    instead of respecting it, which glues the trailing filler onto the answer and
+    hands `extract_answer_number`'s "last number in the string" fallback
+    (`test.py`) whatever number the filler happened to end on.
 
     Rows end at different places, so the result is a list of 1-D tensors rather than
-    a rectangular batch. A row with no EOS is returned whole: the untuned baseline
-    may never emit one, and cutting it at an arbitrary point would be a guess.
-    Text-level stop sequences are the tool for that case, and picking them sensibly
-    needs a look at what the untruncated output actually contains.
+    a rectangular batch. A row with no stop token is returned whole: cutting it at
+    an arbitrary point would be a guess.
     """
-    if eos_token_id is None:
+    if not stop_ids:
         return list(gen_tokens)
 
+    stops = torch.tensor(stop_ids, dtype=gen_tokens.dtype)
     rows = []
     for row in gen_tokens:
-        hit = (row == eos_token_id).nonzero().flatten()
+        hit = torch.isin(row, stops).nonzero().flatten()
         rows.append(row[: hit[0]] if hit.numel() else row)
     return rows
 
@@ -467,13 +535,14 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     eliminates padding -- see `_uniform_length_batches`.
 
     Returns `(accuracy, predictions, gold_answers, completions)`, all four in
-    test-set order. Scoring reads each response only up to its first EOS
-    (`_truncate_at_eos`); `completions` holds the untruncated decode instead, so a
+    test-set order. Scoring reads each response only up to its first stop token
+    (`_truncate_at_stop`); `completions` holds the untruncated decode instead, so a
     later scoring change can be evaluated against stored output.
     """
     model.eval()
 
-    questions = [f"{example['question']}{QUESTION_PROMPT}" for example in test_set]
+    # Identical to the prompts the SFT arms were trained on (`SupervisedDataset`).
+    questions = [build_prompt(tokenizer, example["question"]) for example in test_set]
     answers = []
     for example in test_set["answer"]:
         ans = example.split("####")[-1].replace(",", "")
@@ -489,11 +558,15 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
     # of them straggles at the end.
     local_indices = list(range(rank, len(questions), world_size))
 
+    add_special = template_add_special_tokens(tokenizer)
     prompt_ids = {
-        i: tokenizer(questions[i], return_tensors="pt")["input_ids"][0]
+        i: tokenizer(
+            questions[i], return_tensors="pt", add_special_tokens=add_special
+        )["input_ids"][0]
         for i in local_indices
     }
     pad_id = _pad_token_id(tokenizer)
+    stop_ids = _stop_token_ids(tokenizer)
     batch_size = max(1, int(training_args.benchmark_batch_size))
     batches = _uniform_length_batches(local_indices, prompt_ids, batch_size)
     if rank == 0:
@@ -528,19 +601,19 @@ def diffusion_evaluate(model, tokenizer, test_set, training_args):
         )
         # left padding means the response region starts at the same offset in
         # every row of the batch. One host transfer for the whole batch:
-        # `_truncate_at_eos` reads positions row by row, which on the GPU would be
+        # `_truncate_at_stop` reads positions row by row, which on the GPU would be
         # a device sync per row.
         gen_tokens = out[:, input_ids.shape[1] :].cpu()
         # Kept verbatim for the record: all `gen_length` tokens, special tokens
         # left in. That is what `_write_benchmark_result` stores, so a future
         # scoring rule (text-level stop sequences, a different extractor) can be
         # tried offline against these instead of re-decoding the test set. Cutting
-        # a stored completion at its first EOS marker reproduces what was scored
+        # a stored completion at its first stop marker reproduces what was scored
         # below, up to any other special token inside the answer.
         raw_batch = tokenizer.batch_decode(gen_tokens, skip_special_tokens=False)
         scored_batch = [
             tokenizer.decode(row, skip_special_tokens=True)
-            for row in _truncate_at_eos(gen_tokens, tokenizer.eos_token_id)
+            for row in _truncate_at_stop(gen_tokens, stop_ids)
         ]
         for i, raw, decoded in zip(batch_indices, raw_batch, scored_batch):
             if rank == 0:

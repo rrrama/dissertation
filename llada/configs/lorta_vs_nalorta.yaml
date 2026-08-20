@@ -32,7 +32,8 @@ mask_id: 126336
 diffusion_eps: 0.001
 gen_length: 256
 diffusion_steps: 256
-block_length: 256
+# See baseline.yaml for why this is 32 and not gen_length.
+block_length: 32
 remasking: "low_confidence"
 gen_temperature: 0.0
 # questions decoded simultaneously per rank in benchmark mode (1 = the old
