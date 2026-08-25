@@ -47,9 +47,14 @@ from .awq import dispatch_awq
 from .config import NALorTaConfig
 from .embedding import GaussianFourierProjection
 from .gptq import dispatch_gptq
+from .layer import HEAD_AXIS_IN, HEAD_AXIS_OUT
 from .layer import Linear as NALorTaLinear
-from .layer import NALorTaLayer, dispatch_default
+from .layer import NALorTaDelta, NALorTaLayer, dispatch_default
 from .tp_layer import dispatch_megatron
+
+
+# Order fixes the `lora_C_m` index: 0 = q, 1 = k, 2 = v, 3 = o.
+_TARGET_MATRICES = ("q", "k", "v", "o")
 
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -140,7 +145,7 @@ class NALorTaModel(BaseTuner):
         self._response_mask = None
 
     def _mask_token_proportion(self, input_ids, attention_mask=None, response_mask=None) -> torch.Tensor:
-        """Proportion of the *answer* that is the mask token.
+        """Proportion of the *answer* that is the mask token, per example (``[batch]``).
 
         Masks only ever land in the response, so the numerator is answer-only regardless. The
         denominator is what matters: it must be the answer length, not the whole sequence. With a
@@ -148,6 +153,13 @@ class NALorTaModel(BaseTuner):
         ``t`` -- it can never reach 1.0, it compresses by a per-example factor that depends on
         prompt length, and the ceiling differs between training (true answer length) and
         generation (fixed ``gen_length``). Callers therefore pass ``response_mask``.
+
+        The count is kept *per example*. Pooling it over the micro-batch is exact at generation
+        time (every row is masked over the same window on the same schedule) but not during
+        training, where ``LladaSFTTrainer.compute_loss`` draws one ``t`` per example and answer
+        lengths differ: each row would then be conditioned on the average of its own lambda and
+        an unrelated row's. ``pool_lambda=True`` restores the pooled scalar, broadcast back over
+        the batch, for reproducing earlier runs.
 
         Args:
             input_ids (`torch.Tensor`): Token ids of shape ``[batch, seq]`` (or ``[seq]``).
@@ -159,13 +171,16 @@ class NALorTaModel(BaseTuner):
                 behaviour, kept only so old runs stay reproducible.
 
         Returns:
-            `torch.Tensor`: A scalar in ``[0, 1]`` giving the fraction of (non-padding) answer
-            tokens that equal ``MASK_TOKEN_ID``.
+            `torch.Tensor`: Values in ``[0, 1]`` giving the fraction of (non-padding) answer tokens
+            that equal ``MASK_TOKEN_ID``. Shape ``[batch]``, or ``[1]`` when ``pool_lambda``.
         """
+        if input_ids.dim() == 1:
+            input_ids = input_ids[None, :]
         is_mask = input_ids == self.MASK_TOKEN_ID
 
-        lambda_source = getattr(self.peft_config[self.active_adapters[0]], "lambda_source", "response")
-        if lambda_source == "response":
+        config = self.peft_config[self.active_adapters[0]]
+        valid = None
+        if getattr(config, "lambda_source", "response") == "response":
             if response_mask is None:
                 warnings.warn(
                     "NA-LoRTA is configured with `lambda_source='response'` but no `response_mask` was "
@@ -176,14 +191,18 @@ class NALorTaModel(BaseTuner):
                 )
             else:
                 valid = response_mask.bool()
-                if attention_mask is not None:
-                    valid = valid & attention_mask.bool()
-                return (is_mask & valid).sum() / valid.sum().clamp(min=1)
-
+                if valid.dim() == 1:
+                    valid = valid[None, :]
+        if valid is None:
+            valid = torch.ones_like(is_mask)
         if attention_mask is not None:
-            valid = attention_mask.bool()
-            return (is_mask & valid).sum() / valid.sum().clamp(min=1)
-        return is_mask.float().mean()
+            am = attention_mask.bool()
+            valid = valid & (am[None, :] if am.dim() == 1 else am)
+
+        if getattr(config, "pool_lambda", False):
+            # One lambda for the whole batch: exact only when every row shares one.
+            return ((is_mask & valid).sum() / valid.sum().clamp(min=1)).reshape(1)
+        return (is_mask & valid).sum(dim=-1) / valid.sum(dim=-1).clamp(min=1)
 
     @staticmethod
     def _get_arch_dims(config):
@@ -211,78 +230,39 @@ class NALorTaModel(BaseTuner):
         return ".".join([self.target_names_prefix, f"{layer_idx}", self.qkvo_mapping[target_matrix]])
 
     def _compute_weights_from_tensor(self, input_ids=None, attention_mask=None, response_mask=None):
-        weights = {}
-        # print("*"*100)
-        # print(self.adapter_name_to_module)
-        # print("*"*100)
-        # Mask-proportion modulation: `I_r + eta * Theta^T phi(mask_proportion)`, a length-`r` vector that
-        # multiplies the per-(head, matrix, layer) rank coefficients below. `I_r` is the multiplicative
-        # identity (ones) so that when there is no mask (or no input_ids) we recover the base NALoRTA weights.
-        c_mask = torch.ones_like(self.model.lora_C_m[0])
+        """The CP-factored delta for every adapted matrix, keyed by module name.
+
+        Returns `NALorTaDelta` factors rather than dense matrices; the layer contracts them
+        against the activations in rank space (`NALorTaLayer._apply_delta`). Two things follow
+        from staying factored: the head axis is recorded per matrix instead of being baked into
+        a concatenation order (q/k/v put the heads on their output, `attn_out` on its input),
+        and the noise term may vary along the batch, which a dense `[batch, 4096, 4096]` delta
+        could never afford.
+        """
+        # Mask-proportion modulation: `I_r + eta * Theta^T phi(mask_proportion)`, a `[batch, r]`
+        # tensor that multiplies the per-(head, matrix, layer) rank coefficients below. `I_r` is
+        # the multiplicative identity (ones) so that when there is no mask (or no input_ids) we
+        # recover the base NALoRTA weights -- and, with a batch of one, a mergeable delta.
+        c_mask = torch.ones_like(self.model.lora_C_m[0]).unsqueeze(0)  # (1, r)
         if input_ids is not None:
             mask_proportion = self._mask_token_proportion(input_ids, attention_mask, response_mask)
-            # GaussianFourierProjection expects a 1-D batch; phi has shape (embedding_length,).
-            phi = self.model.lora_phi(mask_proportion.reshape(1)).reshape(-1)
-            phi = phi.to(self.model.lora_Theta.dtype)
-            c_mask = c_mask + self.eta * (self.model.lora_Theta.T @ phi)
-        num_hidden_layers, num_attention_heads, _ = self._get_arch_dims(self.model.config)
+            # GaussianFourierProjection maps a 1-D batch to (batch, embedding_length).
+            phi = self.model.lora_phi(mask_proportion).to(self.model.lora_Theta.dtype)
+            c_mask = c_mask + self.eta * (phi @ self.model.lora_Theta)  # (batch, r)
+
+        num_hidden_layers, _, _ = self._get_arch_dims(self.model.config)
+        weights = {}
         for block_idx in range(num_hidden_layers):
-            weights[self._map_layer_to_adapter(block_idx, "q")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx]
-                        * self.model.lora_C_m[0]
-                        * self.model.lora_C_l[block_idx]
-                        * c_mask
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "k")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx]
-                        * self.model.lora_C_m[1]
-                        * self.model.lora_C_l[block_idx]
-                        * c_mask
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "v")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx]
-                        * self.model.lora_C_m[2]
-                        * self.model.lora_C_l[block_idx]
-                        * c_mask
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "o")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx]
-                        * self.model.lora_C_m[3]
-                        * self.model.lora_C_l[block_idx]
-                        * c_mask
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
+            for matrix_idx, target_matrix in enumerate(_TARGET_MATRICES):
+                # (batch_or_1, n_heads, r) -- C_h keeps its head index all the way into the
+                # layer, where it multiplies whichever of dW's axes actually carries the heads.
+                coef = self.model.lora_C_h * self.model.lora_C_m[matrix_idx] * self.model.lora_C_l[block_idx]
+                weights[self._map_layer_to_adapter(block_idx, target_matrix)] = NALorTaDelta(
+                    A=self.model.lora_A,
+                    B=self.model.lora_B,
+                    coef=c_mask.unsqueeze(1) * coef,
+                    head_axis=HEAD_AXIS_IN if target_matrix == "o" else HEAD_AXIS_OUT,
+                )
         return weights
 
     def forward(self, *args, **kwargs):
@@ -818,15 +798,27 @@ class NALorTaModel(BaseTuner):
                 # Get the base layer
                 base_module = module.base_layer
                 # Get the adapter weight
-                adapter_weight = self.tensor_weights.get(name, None)
-                if adapter_weight is not None:
+                delta = self.tensor_weights.get(name, None)
+                if delta is not None:
+                    adapter_weight = delta.to_dense().to(
+                        device=base_module.weight.device, dtype=base_module.weight.dtype
+                    )
+                    # `nn.Linear.weight` is `(out_features, in_features)`, so this is the
+                    # check that says the head axis went to the right place -- on LLaDA-8B
+                    # every adapted matrix is 4096x4096 and a transposed delta would
+                    # otherwise merge silently.
+                    if adapter_weight.shape != base_module.weight.shape:
+                        raise ValueError(
+                            f"Adapter delta for {name} has shape {tuple(adapter_weight.shape)} but the base "
+                            f"weight is {tuple(base_module.weight.shape)}."
+                        )
                     # Perform safe merge check if requested
                     if safe_merge:
                         if torch.isnan(adapter_weight).any() or torch.isinf(adapter_weight).any():
                             raise ValueError(f"NaN or Inf detected in adapter weights for module {name}")
 
                     # Merge the adapter weight into the base weight
-                    base_module.weight.data += adapter_weight.to(base_module.weight.device) * module.scaling["default"]
+                    base_module.weight.data += adapter_weight * module.scaling["default"]
                 # Replace the module with the base_layer
                 parent, _, target_name = _get_submodules(self.model, name)
                 setattr(parent, target_name, base_module)

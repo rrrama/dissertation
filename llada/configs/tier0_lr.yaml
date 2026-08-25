@@ -1,0 +1,83 @@
+# Tier 0, backbone learning rate -- the CP family (IMPLEMENTATION_PLAN.md 4.1a).
+#
+# 6 runs: `eta: [0, 1.0]` x `learning_rate: [1e-4, 3e-4, 1e-3]`. Selection metric is
+# `eval_loss_frozen` on the 250-question dev carve-out; no generation at all, so these
+# are short jobs and the test set is never touched (EXPERIMENT_DESIGN.md §3.3, §6).
+#
+# Why only the CP family is here (O4): the matrix family is fixed at 1e-4 -- the
+# conventional two-factor-adapter value and the midpoint of §7's proposed matrix grid --
+# and so has no backbone grid to sweep. Its eta=1 cell is covered by the head-LR sweep
+# in `tier0_headlr_matrix.yaml`; its eta=0 cell (`lora`) has no free hyperparameter left
+# and is first trained in Tier 1. That deviates from §5 rule 1 and is stated as such in
+# the writeup: the arm being advocated is the one that got the search.
+#
+# Why both eta cells are swept rather than selecting on eta=1 and reusing it: at eta=0
+# this run *is* `lorta`, a headline cell of the Tier 1 2x2, and §5's stated failure mode
+# is winning because the baseline was under-tuned. If both cells select the same LR, say
+# so -- it makes the eta comparison cleaner, not weaker.
+#
+# The CP grid is shifted up from the matrix one on structural grounds (§5): LoRTA's
+# update is a product of five factors, so the gradient w.r.t. any one carries the
+# product of the other four. **If a cell selects an endpoint, extend the grid** -- §7 is
+# explicit that an endpoint selection is not to be accepted.
+#
+# Runs as: python batch_train.py --mode all --config configs/tier0_lr.yaml
+
+model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+tuning_type: "nalorta"
+eta: [0, 1.0]
+
+# alpha/r = 0.125, fixed across every run in the project (§5.4). alpha/r multiplies the
+# update and is degenerate with LR, so sweeping both wastes a grid dimension.
+rank: 32
+lora_alpha: 4
+fourier_m: 32
+# Held equal across arms (O3). NA-LoRTA's own default is already 0.1; it is written out
+# so that this file and `tier0_headlr_matrix.yaml` -- where NaRA's default would be 0.05
+# -- are demonstrably the same treatment rather than coincidentally so.
+lora_dropout: 0.1
+
+data_name: "gsm8k"
+
+learning_rate: [0.0001, 0.0003, 0.001]
+# 1-2 epochs, per §7. ~7223 train examples after the dev carve-out at an effective batch
+# of 2 x 10 x 3 = 60 gives ~120 steps/epoch, so ~241 steps here. Note LR is therefore
+# selected at a shortened budget while Tier 1 may run longer; that is standard, all arms
+# are shortened identically, and O7a records it as accepted residual risk.
+num_train_epochs: 2
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 10
+gradient_checkpointing: false
+warmup_ratio: 0.03
+lr_scheduler_type: "cosine"
+seed: 42
+model_max_length: 512
+
+# ~2-3 h of training. The benchmark is ~2000 forwards behind a model load -- minutes --
+# so it asks for its own budget rather than holding a training-sized reservation.
+sbatch_time: "04:00:00"
+sbatch_time_benchmark: "01:00:00"
+
+expt_name: "tier0_lr"
+wandb_project: "llada_gsm8k_training"
+report_to: "wandb"
+logging_strategy: "steps"
+logging_steps: 10
+save_strategy: "steps"
+save_steps: 100
+
+# The eval_loss_frozen curve during training (FROZEN_EVAL_SPEC.md §7). ~4 firings over
+# this run at a couple of minutes each. The authoritative number is still the benchmark
+# below, against the saved adapter; the curve is what separates "this LR is wrong" from
+# "this LR diverged at step 150 and partly recovered", which one endpoint cannot.
+eval_loss_frozen_steps: 50
+
+mask_id: 126336
+diffusion_eps: 0.001
+
+nproc_per_node: 3
+gres: "gpu:lovelace_l40:3"
+
+# Tier 0's only metric. No generation -- decoding is 6 h and buys nothing for an LR
+# ranking (§6's evaluation tiers).
+benchmark: "eval_loss_frozen"

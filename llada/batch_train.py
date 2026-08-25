@@ -45,6 +45,7 @@ without importing torch/transformers.
 """
 
 import argparse
+import glob
 import itertools
 import json
 import os
@@ -77,6 +78,7 @@ SLURM_META_KEYS = {
     "cpus_per_task",
     "job_name",
     "sbatch_time",
+    "sbatch_time_benchmark",
     "sbatch_mem",
 }
 
@@ -90,6 +92,13 @@ NAME_ABBREV = {
     "tuning_type": "",
     "per_device_train_batch_size": "bs",
     "gradient_accumulation_steps": "ga",
+    # Tier 0 sweeps these, and the unabbreviated fallback would name a run directory
+    # `eta0.0_head_learning_rate0.0003_learning_rate0.0001` -- long enough to trip the
+    # 80-character guard in `run_name` and fall back to `run_003`, which is exactly the
+    # comparability §8's naming convention is trying to preserve.
+    "eta": "eta",
+    "head_learning_rate": "hlr",
+    "fourier_m": "m",
 }
 
 SBATCH_TEMPLATE = """#!/bin/bash
@@ -232,12 +241,36 @@ def _slurm_settings(run_cfg, mode):
     # Benchmark sampling cannot be split within a question, but it is embarrassingly
     # parallel *across* questions: each rank samples its own shard of the GSM8K test
     # set (see diffusion_evaluate), so benchmarks use the same GPU count as training.
+    #
+    # Measured on this cluster (3x L40, the defaults above): a 6-epoch training run
+    # takes ~8 h and a full 1319-question benchmark decode ~6 h. The 8 h default below
+    # therefore fits a benchmark with ~2 h of margin and fits the short Tier 0 runs
+    # (1-2 epochs, ~2-3 h) several times over -- asking for 12 h bought nothing and
+    # cost queue priority on every job.
+    #
+    # `sbatch_time` covers both modes unless `sbatch_time_benchmark` overrides the
+    # benchmark job. That override exists for Tier 0, where the two are wildly
+    # asymmetric: training is a couple of hours but `eval_loss_frozen` is ~2000
+    # forwards behind a model load, i.e. minutes. Asking for the training budget on
+    # twelve short benchmark jobs costs queue priority and buys nothing. Benchmarks
+    # that *decode* (gsm8k_accuracy, ~6 h) must not set it.
+    #
+    # !! A *6-epoch* training run measured ~8 h, i.e. exactly this budget with no
+    # margin, and nothing passes `resume_from_checkpoint`, so a wall-clock kill loses
+    # the run rather than resuming it. Tier 1 configs (full training) must set
+    # `sbatch_time` explicitly -- 12:00:00 is the value they inherited before this
+    # default changed. The O1/O2 CP-factored delta should have made the forward
+    # cheaper, but that has not been timed; do not assume it bought headroom.
     return {
         "nproc_per_node": nproc,
         "gres": gres,
         "partition": run_cfg.get("partition", "gpu"),
         "cpus_per_task": run_cfg.get("cpus_per_task", 3),
-        "sbatch_time": run_cfg.get("sbatch_time", "12:00:00"),
+        "sbatch_time": (
+            run_cfg.get("sbatch_time_benchmark")
+            if mode == "benchmark" and run_cfg.get("sbatch_time_benchmark")
+            else run_cfg.get("sbatch_time", "08:00:00")
+        ),
         "sbatch_mem": run_cfg.get("sbatch_mem", "120G"),
     }
 
@@ -326,8 +359,28 @@ def _is_benchmarkable(run_cfg, run_dir):
     return _is_baseline(run_cfg) or _is_trained(run_dir)
 
 
+def _benchmark_result_files(run_dir):
+    """Every benchmark result in a run directory.
+
+    One file per benchmark, so dev accuracy, test accuracy and `eval_loss_frozen` on
+    the same adapter stop overwriting each other. `gsm8k_accuracy` keeps the original
+    `benchmark.json` name and schema (O5); the rest are `benchmark_{name}.json`.
+    """
+    return sorted(glob.glob(os.path.join(run_dir, "benchmark*.json")))
+
+
+# The fields each benchmark contributes to its `summary.json` entry. `gsm8k_accuracy`
+# lists `accuracy` alone, so its entries are byte-identical to what they were before
+# other benchmarks existed. An unregistered benchmark still gets an entry -- name and
+# status -- rather than being dropped from the summary silently.
+BENCHMARK_SUMMARY_FIELDS = {
+    "gsm8k_accuracy": ("accuracy",),
+    "eval_loss_frozen": ("eval_loss_frozen", "per_t", "adapter_params"),
+}
+
+
 def _clear_stale_results(run_dir, no_submit):
-    """Drop a previous run's benchmark.json, which `--overwrite` has invalidated.
+    """Drop a previous run's benchmark results, which `--overwrite` has invalidated.
 
     train.py only rewrites that file when a benchmark *finishes*, which is ~20 h
     after the training job it depends on. Until then the old result sits next to
@@ -339,15 +392,13 @@ def _clear_stale_results(run_dir, no_submit):
     Not called without `--overwrite`: that is the flag that says the run's outputs
     are expendable. A dry run (`--no-submit`) only says what it would remove.
     """
-    bench_path = os.path.join(run_dir, "benchmark.json")
-    if not os.path.exists(bench_path):
-        return
-    rel = os.path.relpath(bench_path, LLADA_DIR)
-    if no_submit:
-        print(f"  [overwrite] would remove stale {rel}")
-        return
-    os.remove(bench_path)
-    print(f"  [overwrite] removed stale {rel}")
+    for bench_path in _benchmark_result_files(run_dir):
+        rel = os.path.relpath(bench_path, LLADA_DIR)
+        if no_submit:
+            print(f"  [overwrite] would remove stale {rel}")
+            continue
+        os.remove(bench_path)
+        print(f"  [overwrite] removed stale {rel}")
 
 
 def _prepare_run_dir(exp_dir, name):
@@ -389,19 +440,27 @@ def write_summary(exp_dir, runs_info, mode):
             "run_dir": os.path.relpath(info["run_dir"], LLADA_DIR),
             "varying": info["varying"],
         }
-        bench_path = os.path.join(info["run_dir"], "benchmark.json")
-        if os.path.exists(bench_path):
+        result_files = _benchmark_result_files(info["run_dir"])
+        if not result_files:
+            entry["status"] = "pending"
+            summary["runs"].append(entry)
+            continue
+        # One entry per (run, benchmark): the same adapter is scored on dev accuracy,
+        # test accuracy and eval_loss_frozen, and collapsing those into one row was
+        # what made them overwrite each other in the first place.
+        for bench_path in result_files:
+            bench_entry = dict(entry)
             try:
                 with open(bench_path) as f:
                     bench = json.load(f)
-                entry["benchmark"] = bench.get("benchmark")
-                entry["accuracy"] = bench.get("accuracy")
-                entry["status"] = "done"
+                name = bench.get("benchmark")
+                bench_entry["benchmark"] = name
+                for key in BENCHMARK_SUMMARY_FIELDS.get(name, ()):
+                    bench_entry[key] = bench.get(key)
+                bench_entry["status"] = "done"
             except (OSError, json.JSONDecodeError):
-                entry["status"] = "unreadable"
-        else:
-            entry["status"] = "pending"
-        summary["runs"].append(entry)
+                bench_entry["status"] = "unreadable"
+            summary["runs"].append(bench_entry)
 
     summary_path = os.path.join(exp_dir, "summary.json")
     with open(summary_path, "w") as f:

@@ -1,0 +1,73 @@
+# Tier 0, head learning rate -- the matrix family (IMPLEMENTATION_PLAN.md 4.1b).
+#
+# 3 runs: `nara` at its fixed backbone LR of 1e-4, sweeping the noise head's own LR.
+# §5.2 gives the head (NaRA's mapper MLP, NA-LoRTA's Theta) a separate optimiser group
+# because a single global LR forces a compromise between components with very different
+# curvature -- the head sits multiplicatively on top of every backbone factor -- and
+# that makes *both* noise-aware methods look worse than they are.
+#
+# **This file does not depend on `tier0_lr.yaml`** and can be submitted at the same
+# time: O4 fixed the matrix family's backbone LR, so there is nothing here to wait for.
+# The CP family's head sweep does have to wait, since its backbone LR is what
+# `tier0_lr.yaml` selects.
+#
+# eta=1 only. At eta=0 the head's output is multiplied by zero, so its learning rate
+# cannot affect anything; the eta=0 cells inherit the backbone LR and nothing else.
+#
+# The grid is 0.3x / 1x / 3x the backbone LR -- symmetric, so it can select in either
+# direction, and the middle cell reproduces the single-group optimiser exactly and is
+# therefore the reference point for whether splitting the groups helped at all. §7's
+# rule applies: if an endpoint is selected, extend the grid rather than accept it.
+#
+# Runs as: python batch_train.py --mode all --config configs/tier0_headlr_matrix.yaml
+
+model_name_or_path: "GSAI-ML/LLaDA-8B-Instruct"
+tuning_type: "nara"
+eta: 1.0
+
+rank: 32
+lora_alpha: 4
+fourier_m: 64
+# NaRA's own default is 0.05. Held at 0.1 to match every other arm (O3): the effect is
+# well inside the noise floor §6 sets, but it is an unstated per-method difference in a
+# comparison whose whole claim is "identical treatment except the adapter".
+lora_dropout: 0.1
+
+data_name: "gsm8k"
+
+# Fixed by O4, not swept. 1e-4 is the conventional two-factor-adapter value and the
+# midpoint of §7's proposed matrix grid; the historical record for why the top of that
+# grid was the risky end is in `configs/nara_vs_nalorta.yaml` (NaRA diverged to all-NaN
+# at 0.05, 262 of 263 checkpoint tensors non-finite).
+learning_rate: 0.0001
+head_learning_rate: [0.00003, 0.0001, 0.0003]
+
+num_train_epochs: 2
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 10
+gradient_checkpointing: false
+warmup_ratio: 0.03
+lr_scheduler_type: "cosine"
+seed: 42
+model_max_length: 512
+
+sbatch_time: "04:00:00"
+sbatch_time_benchmark: "01:00:00"
+
+expt_name: "tier0_headlr_matrix"
+wandb_project: "llada_gsm8k_training"
+report_to: "wandb"
+logging_strategy: "steps"
+logging_steps: 10
+save_strategy: "steps"
+save_steps: 100
+
+eval_loss_frozen_steps: 50
+
+mask_id: 126336
+diffusion_eps: 0.001
+
+nproc_per_node: 3
+gres: "gpu:lovelace_l40:3"
+
+benchmark: "eval_loss_frozen"

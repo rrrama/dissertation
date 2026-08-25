@@ -46,9 +46,14 @@ from .aqlm import dispatch_aqlm
 from .awq import dispatch_awq
 from .config import LorTaConfig
 from .gptq import dispatch_gptq
+from .layer import HEAD_AXIS_IN, HEAD_AXIS_OUT
 from .layer import Linear as LorTaLinear
-from .layer import LorTaLayer, dispatch_default
+from .layer import LorTaDelta, LorTaLayer, dispatch_default
 from .tp_layer import dispatch_megatron
+
+
+# Order fixes the `lora_C_m` index: 0 = q, 1 = k, 2 = v, 3 = o.
+_TARGET_MATRICES = ("q", "k", "v", "o")
 
 
 def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
@@ -161,56 +166,26 @@ class LorTaModel(BaseTuner):
         return ".".join([self.target_names_prefix, f"{layer_idx}", self.qkvo_mapping[target_matrix]])
 
     def _compute_weights_from_tensor(self):
+        """The CP-factored delta for every adapted matrix, keyed by module name.
+
+        Returns `LorTaDelta` factors rather than dense matrices; the layer contracts them
+        against the activations in rank space (`LorTaLayer._apply_delta`). The head axis is
+        recorded per matrix instead of being baked into a concatenation order: q/k/v put
+        the heads on their output, `attn_out` on its input.
+        """
+        num_hidden_layers, _, _ = self._get_arch_dims(self.model.config)
         weights = {}
-        # print("*"*100)
-        # print(self.adapter_name_to_module)
-        # print("*"*100)
-        num_hidden_layers, num_attention_heads, _ = self._get_arch_dims(self.model.config)
         for block_idx in range(num_hidden_layers):
-            weights[self._map_layer_to_adapter(block_idx, "q")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx] * self.model.lora_C_m[0] * self.model.lora_C_l[block_idx]
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "k")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx] * self.model.lora_C_m[1] * self.model.lora_C_l[block_idx]
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "v")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx] * self.model.lora_C_m[2] * self.model.lora_C_l[block_idx]
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
-            weights[self._map_layer_to_adapter(block_idx, "o")] = torch.cat(
-                [
-                    self.model.lora_A
-                    @ torch.diag(
-                        self.model.lora_C_h[head_idx] * self.model.lora_C_m[3] * self.model.lora_C_l[block_idx]
-                    )
-                    @ self.model.lora_B
-                    for head_idx in range(num_attention_heads)
-                ],
-                dim=1,
-            )
+            for matrix_idx, target_matrix in enumerate(_TARGET_MATRICES):
+                # (n_heads, r) -- C_h keeps its head index all the way into the layer,
+                # where it multiplies whichever of dW's axes actually carries the heads.
+                coef = self.model.lora_C_h * self.model.lora_C_m[matrix_idx] * self.model.lora_C_l[block_idx]
+                weights[self._map_layer_to_adapter(block_idx, target_matrix)] = LorTaDelta(
+                    A=self.model.lora_A,
+                    B=self.model.lora_B,
+                    coef=coef.unsqueeze(0),
+                    head_axis=HEAD_AXIS_IN if target_matrix == "o" else HEAD_AXIS_OUT,
+                )
         return weights
 
     def forward(self, *args, **kwargs):
@@ -715,15 +690,27 @@ class LorTaModel(BaseTuner):
                 # Get the base layer
                 base_module = module.base_layer
                 # Get the adapter weight
-                adapter_weight = self.tensor_weights.get(name, None)
-                if adapter_weight is not None:
+                delta = self.tensor_weights.get(name, None)
+                if delta is not None:
+                    adapter_weight = delta.to_dense().to(
+                        device=base_module.weight.device, dtype=base_module.weight.dtype
+                    )
+                    # `nn.Linear.weight` is `(out_features, in_features)`, so this is the
+                    # check that says the head axis went to the right place -- on LLaDA-8B
+                    # every adapted matrix is 4096x4096 and a transposed delta would
+                    # otherwise merge silently.
+                    if adapter_weight.shape != base_module.weight.shape:
+                        raise ValueError(
+                            f"Adapter delta for {name} has shape {tuple(adapter_weight.shape)} but the base "
+                            f"weight is {tuple(base_module.weight.shape)}."
+                        )
                     # Perform safe merge check if requested
                     if safe_merge:
                         if torch.isnan(adapter_weight).any() or torch.isinf(adapter_weight).any():
                             raise ValueError(f"NaN or Inf detected in adapter weights for module {name}")
 
                     # Merge the adapter weight into the base weight
-                    base_module.weight.data += adapter_weight.to(base_module.weight.device) * module.scaling["default"]
+                    base_module.weight.data += adapter_weight * module.scaling["default"]
                 # Replace the module with the base_layer
                 parent, _, target_name = _get_submodules(self.model, name)
                 setattr(parent, target_name, base_module)

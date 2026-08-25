@@ -58,6 +58,9 @@ class NALorTaConfig(PeftConfig):
             the target modules manually.
         lora_alpha (`int`):
             The alpha parameter for Lora scaling.
+        pool_lambda (`bool`):
+            Condition the whole micro-batch on one pooled mask proportion rather than one per
+            example. Exact at generation time, not during training; see the field's help text.
         lora_dropout (`float`):
             The dropout probability for Lora layers.
         fan_in_fan_out (`bool`):
@@ -149,6 +152,19 @@ class NALorTaConfig(PeftConfig):
                 "that is the pre-`response_mask` behaviour and is kept only so earlier runs remain "
                 "reproducible -- it caps the proportion below 1.0 by a per-example, prompt-length-dependent "
                 "factor and shifts between training and generation."
+            )
+        },
+    )
+    pool_lambda: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Condition the whole micro-batch on a single, token-weighted mask proportion "
+                "instead of one per example. Pooling is exact at generation time -- every row "
+                "masks the same window on the same schedule -- but not during training, where "
+                "each example draws its own `t` and has its own answer length, so a row would be "
+                "conditioned on the average of its lambda and its batch-mates'. Kept only so runs "
+                "made before per-example conditioning remain reproducible."
             )
         },
     )

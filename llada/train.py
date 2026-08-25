@@ -32,6 +32,8 @@ from test import (
     template_add_special_tokens,
 )
 from generate import generate, MASK_ID
+from adapter_params import summarise_adapter_params
+from splits import train_split
 import wandb
 
 IGNORE_INDEX = -100
@@ -47,7 +49,7 @@ NO_ADAPTER = "none"
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
-        default="GSAI-ML/LLaDA-8B-Base",
+        default="GSAI-ML/LLaDA-8B-Instruct",
         metadata={"help": "Path to the model."},
     )
     adapter_name_or_path: Optional[str] = field(
@@ -74,6 +76,38 @@ class ModelArguments:
             "help": "Adapter to train: 'lora', 'lorta', 'nalorta' or 'nara'. "
             "'none' is the untuned-baseline pseudo-adapter: benchmark-only, it "
             "scores the bare base model (see NO_ADAPTER)."
+        },
+    )
+    # --- Adapter hyperparameters shared across tuning types ---
+    #
+    # All three default to None, meaning "keep this adapter's own default"
+    # (`ADAPTER_DEFAULTS`). That way naming a field in a YAML changes exactly the
+    # runs that name it, and every config written before these existed still
+    # resolves to the values that were hardcoded in `_build_peft_config`.
+    eta: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Strength of the noise-conditioning term, under one name for both "
+            "noise-aware adapters: NA-LoRTA's `eta` in `I_r + eta * Theta^T phi(lambda)` "
+            "and NaRA's `c_scale` in `I_r + c_scale * F_phi(e(lambda))`. `eta: 0` "
+            "collapses nalorta -> lorta and nara -> lora exactly, which is how the "
+            "non-noise-aware cells of the 2x2 are produced (EXPERIMENT_DESIGN.md §2). "
+            "Ignored, with a warning, by 'lora' and 'lorta'."
+        },
+    )
+    fourier_m: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Width of the Fourier embedding of lambda, under one name for both "
+            "noise-aware adapters: NA-LoRTA's `embedding_length` and NaRA's "
+            "`embedding_dim`. Must be even. Ignored, with a warning, by 'lora' and 'lorta'."
+        },
+    )
+    lora_dropout: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Dropout on the adapter input. Per-adapter defaults differ (see "
+            "ADAPTER_DEFAULTS); set this to hold it constant across a comparison."
         },
     )
 
@@ -113,6 +147,30 @@ class TrainingArguments(transformers.TrainingArguments):
     diffusion_eps: float = field(
         default=1e-3,
         metadata={"help": "Lower bound on the masking probability during SFT."},
+    )
+    head_learning_rate: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Learning rate for the noise head (NA-LoRTA's Theta, NaRA's mapper) "
+            "as distinct from the backbone factors. None means 'use `learning_rate`', "
+            "which reproduces the single-group optimiser exactly, so lora/lorta are "
+            "unaffected. EXPERIMENT_DESIGN.md §5.2: a single global LR forces a "
+            "compromise between components with very different curvature and makes "
+            "*both* noise-aware methods look worse than they are."
+        },
+    )
+    eval_loss_frozen_steps: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Compute `eval_loss_frozen` (frozen_eval.py) every N optimizer "
+            "steps and log it beside the training curve. None disables it, so no "
+            "existing config changes behaviour. Tier 0 should set it: selecting a "
+            "learning rate from one end-of-run number cannot distinguish 'this LR is "
+            "wrong' from 'this LR diverged at step 400 and partly recovered', and the "
+            "metric is ~2000 forwards. Note this is NOT `eval_steps`, which drives the "
+            "Trainer's own evaluation loop and is a no-op here (there is no "
+            "eval_dataset). See FROZEN_EVAL_SPEC.md §7."
+        },
     )
     # --- Diffusion sampler (eval) hyperparameters ---
     gen_length: int = field(
@@ -289,11 +347,121 @@ def make_supervised_data_module(
     """Make dataset and collator for supervised fine-tuning."""
     logging.warning("Downloading Data")
     train_set = load_dataset(data_args.data_name, "main", split="train")
+    # Hold out the 250-question dev split (EXPERIMENT_DESIGN.md 3.3). Training on it
+    # would make `gsm8k_accuracy_dev` and `eval_loss_frozen` scores of memorisation
+    # rather than of generalisation, and those are what every selection decision in
+    # the project is made on.
+    train_set = train_split(train_set)
     train_dataset = SupervisedDataset(raw_data=train_set, tokenizer=tokenizer)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(
         train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator
     )
+
+
+# Parameter-name substrings identifying the *noise head* -- the part of an adapter that
+# maps lambda to a modulation -- as opposed to the backbone factors it modulates. §5.2
+# gives the two their own learning rates because their curvature differs sharply: the
+# head sits multiplicatively on top of every backbone factor.
+#
+#   lora_Theta       NA-LoRTA's Theta, in `c_mask = 1 + eta * (phi(lambda) @ Theta)`
+#   lora_mapper      NaRA's MLP, in `C(lambda) = I_r + c_scale * F_phi(e(lambda))`
+#   lora_constant_c  NaRA's learned constant term alongside it
+#   lora_phi         the lambda embedding. Frozen for `embedding_type: "fourier"` (both
+#                    tuners), so it never reaches the optimiser today -- named here
+#                    because if it ever becomes trainable (NaRA's "mlp" embedding) it is
+#                    part of the noise function, not of the backbone.
+#
+# Everything else trainable is backbone: A, B, C_l, C_h, C_m for the CP tuners, and the
+# per-layer lora_A / lora_B for the matrix ones.
+HEAD_PARAM_NAMES = ("lora_Theta", "lora_mapper", "lora_constant_c", "lora_phi")
+
+
+def _is_head_parameter(name: str) -> bool:
+    return any(marker in name for marker in HEAD_PARAM_NAMES)
+
+
+def diffusion_masked_loss(
+    model,
+    input_ids,
+    response_mask,
+    attention_mask,
+    t,
+    masked_indices,
+    mask_id,
+    diffusion_eps,
+    pass_response_mask=True,
+):
+    """The LLaDA diffusion objective, given an already-chosen noise level and mask.
+
+    Everything `compute_loss` does *after* sampling, factored out so that
+    `frozen_eval.py` can score a checkpoint on a fixed `(t, mask)` set by calling the
+    same code the run was trained with. A second implementation would drift the first
+    time either was touched, and the Tier 0 metric would stop measuring the thing being
+    trained without any number looking wrong (`FROZEN_EVAL_SPEC.md` §1).
+
+    Returns `(per_example_loss, logits)`, where `per_example_loss` is `(b,)` rather than
+    the batch mean: the eval's mean must be over the *eval set*, not an average of
+    per-batch means, which differ whenever batches are unequal in size. `compute_loss`
+    finishes the job with `.sum() / b`. The pair rather than the bare `(b,)` of the spec
+    is for `Trainer.compute_loss`'s `return_outputs` contract, which needs the logits.
+
+    `t` is the noise level, not `p_mask`: `p_mask` is derived here from the caller's
+    `diffusion_eps`, so a change to `diffusion_eps` reaches the eval instead of leaving
+    it pinned to whatever value was in force when the frozen set was generated.
+
+    `masked_indices` must already satisfy the >=1-masked-token guarantee; the two call
+    sites establish it differently and deliberately (`FROZEN_EVAL_SPEC.md` §5a).
+
+    `pass_response_mask` is False for exactly one caller -- the bare base model
+    (`tuning_type: none`), whose forward has no such kwarg. It is a parameter rather
+    than something sniffed from `special_peft_forward_args` because sniffing is how an
+    adapted model that mislays that attribute silently falls back to a prompt+answer
+    lambda denominator and returns a plausible number for the wrong conditioning.
+    """
+    b, l = input_ids.shape
+    p_mask = ((1 - diffusion_eps) * t + diffusion_eps)[:, None].expand(-1, l)  # (b, l)
+
+    noisy_batch = torch.where(masked_indices, mask_id, input_ids)
+
+    # Padding is excluded from attention. LLaDA attends *bidirectionally*, so
+    # without this every real token of a short example attends to the padding
+    # that its longer batch-mate forced onto the batch -- i.e. an example's
+    # hidden states depend on who it was collated with. It also keeps the
+    # padding out of the noise-aware adapters' mask-proportion statistic,
+    # which takes the attention_mask into account when it is given one
+    # (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`);
+    # otherwise pad positions inflate that proportion's denominator without
+    # ever contributing to its numerator.
+    #
+    # `response_mask` marks the answer region. The noise-aware adapters
+    # (NA-LoRTA, NaRA) condition on the masked *proportion of the answer*,
+    # and that denominator is not recoverable from `input_ids`: the response
+    # holds unmasked tokens too. PEFT lists `response_mask` in
+    # `special_peft_forward_args`, so it reaches the tuner and is stripped
+    # before LLaDA is called; the other tuning types simply ignore it.
+    extra = {"response_mask": response_mask} if pass_response_mask else {}
+    logits = model(input_ids=noisy_batch, attention_mask=attention_mask, **extra).logits
+
+    # 1/t reweighting and per-example answer-length normalisation
+    answer_lengths = response_mask.sum(dim=-1, keepdim=True).clamp(min=1).expand(-1, l)
+
+    token_loss = (
+        F.cross_entropy(
+            logits[masked_indices], input_ids[masked_indices], reduction="none"
+        )
+        / p_mask[masked_indices]
+        / answer_lengths[masked_indices]
+    )
+
+    # Scatter into a dense (b, l) and sum along the sequence, rather than
+    # `index_add_` over row indices: the latter uses atomics on CUDA and is
+    # therefore non-deterministic, which is exactly what `eval_loss_frozen` cannot
+    # afford (FROZEN_EVAL_SPEC.md §5). Masked assignment plus a reduction is
+    # deterministic and the (b, l) buffer is negligible next to the logits.
+    per_token = torch.zeros(b, l, dtype=token_loss.dtype, device=token_loss.device)
+    per_token[masked_indices] = token_loss
+    return per_token.sum(dim=1), logits
 
 
 class LladaSFTTrainer(Trainer):
@@ -314,6 +482,71 @@ class LladaSFTTrainer(Trainer):
         self.mask_id = mask_id
         self.diffusion_eps = diffusion_eps
 
+    def create_optimizer(self):
+        """Give the noise head its own learning rate (EXPERIMENT_DESIGN.md §5.2).
+
+        Built by splitting the groups `Trainer.create_optimizer` already made, rather
+        than by rebuilding them: the weight-decay partition, the optimiser class and its
+        kwargs are all version-dependent internals, and inheriting them means this
+        cannot drift from whatever the installed transformers does. Splitting a group
+        copies its dict and replaces `params`/`lr`, so every other default carries over.
+
+        With `head_learning_rate` unset the base implementation is returned untouched --
+        the single-LR path is preserved exactly, which matters because lora and lorta
+        have no head at all and must not be perturbed by this existing.
+        """
+        optimizer = super().create_optimizer()
+
+        head_lr = self.args.head_learning_rate
+        if head_lr is None or head_lr == self.args.learning_rate:
+            self._head_group_indices = ()
+            return optimizer
+
+        head_ids = {
+            id(param)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and _is_head_parameter(name)
+        }
+        if not head_ids:
+            raise ValueError(
+                f"head_learning_rate={head_lr} is set, but no trainable parameter of "
+                f"tuning type in this run matches {HEAD_PARAM_NAMES}. For 'lora' and "
+                "'lorta' that is expected -- they have no noise head -- and so is a "
+                "config error: drop head_learning_rate. At eta=0 the head is multiplied "
+                "by zero, so its LR cannot affect anything either."
+            )
+
+        groups, head_indices = [], []
+        for group in optimizer.param_groups:
+            head = [p for p in group["params"] if id(p) in head_ids]
+            backbone = [p for p in group["params"] if id(p) not in head_ids]
+            if backbone:
+                groups.append({**group, "params": backbone})
+            if head:
+                head_indices.append(len(groups))
+                groups.append({**group, "params": head, "lr": head_lr})
+        optimizer.param_groups = groups
+        self._head_group_indices = tuple(head_indices)
+
+        num_head = sum(len(groups[i]["params"]) for i in head_indices)
+        print(
+            f"Optimiser: {len(groups)} param groups; {num_head} head tensor(s) at "
+            f"lr={head_lr}, the rest at lr={self.args.learning_rate}"
+        )
+        return optimizer
+
+    def log(self, logs, *args, **kwargs):
+        """Log the head LR beside the backbone one.
+
+        The Trainer reports `learning_rate` from the *first* param group, so with two
+        groups on different schedules half the optimiser state would go unrecorded --
+        and §8 requires the head LR in the run's log.
+        """
+        for index in getattr(self, "_head_group_indices", ()):
+            logs["head_learning_rate"] = self.optimizer.param_groups[index]["lr"]
+            break
+        return super().log(logs, *args, **kwargs)
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         input_ids = inputs["input_ids"]
         labels = inputs["labels"]
@@ -330,51 +563,102 @@ class LladaSFTTrainer(Trainer):
         masked_indices = (
             torch.rand((b, l), device=input_ids.device) < p_mask
         ) & response_mask
-        # guarantee at least one masked token so the loss is well defined
+        # Guarantee at least one masked token so the loss is well defined. Note this
+        # is a *batch-level* check: it fires only when nothing anywhere in the
+        # micro-batch is masked, so an individual example may legitimately draw an
+        # all-clean mask and contribute exactly zero. The frozen eval set forces a
+        # token per *item* instead, because a zero-loss item is not a sample of
+        # anything -- a deliberate divergence, written up in FROZEN_EVAL_SPEC.md §5a.
         if not masked_indices.any():
             first_response = response_mask.float().argmax(dim=1)
             masked_indices[torch.arange(b, device=input_ids.device), first_response] = (
                 response_mask.any(dim=1)
             )
 
-        noisy_batch = torch.where(masked_indices, self.mask_id, input_ids)
-
-        # Padding is excluded from attention. LLaDA attends *bidirectionally*, so
-        # without this every real token of a short example attends to the padding
-        # that its longer batch-mate forced onto the batch -- i.e. an example's
-        # hidden states depend on who it was collated with. It also keeps the
-        # padding out of the noise-aware adapters' mask-proportion statistic,
-        # which takes the attention_mask into account when it is given one
-        # (`peft/src/peft/tuners/nalorta/model.py:_mask_token_proportion`);
-        # otherwise pad positions inflate that proportion's denominator without
-        # ever contributing to its numerator.
-        #
-        # `response_mask` marks the answer region. The noise-aware adapters
-        # (NA-LoRTA, NaRA) condition on the masked *proportion of the answer*,
-        # and that denominator is not recoverable from `input_ids`: the response
-        # holds unmasked tokens too. PEFT lists `response_mask` in
-        # `special_peft_forward_args`, so it reaches the tuner and is stripped
-        # before LLaDA is called; the other tuning types simply ignore it.
-        logits = model(
-            input_ids=noisy_batch,
-            attention_mask=inputs["attention_mask"],
+        per_example_loss, logits = diffusion_masked_loss(
+            model,
+            input_ids=input_ids,
             response_mask=response_mask,
-        ).logits
-
-        # 1/t reweighting and per-example answer-length normalisation
-        answer_lengths = (
-            response_mask.sum(dim=-1, keepdim=True).clamp(min=1).expand(-1, l)
+            attention_mask=inputs["attention_mask"],
+            t=t,
+            masked_indices=masked_indices,
+            mask_id=self.mask_id,
+            diffusion_eps=self.diffusion_eps,
         )
-
-        token_loss = (
-            F.cross_entropy(
-                logits[masked_indices], input_ids[masked_indices], reduction="none"
-            )
-            / p_mask[masked_indices]
-        )
-        loss = torch.sum(token_loss / answer_lengths[masked_indices]) / b
+        loss = per_example_loss.sum() / b
 
         return (loss, logits) if return_outputs else loss
+
+
+class FrozenEvalCallback(transformers.TrainerCallback):
+    """Log `eval_loss_frozen` *during* training, not only at the end of it.
+
+    Tier 0 selects learning rates, and one number at the end of a 1-2 epoch run is thin
+    evidence for that: it cannot separate "this LR is wrong" from "this LR diverged and
+    partly recovered", which is exactly the distinction the sweep exists to make. The
+    metric is ~2000 forwards, so a curve is affordable (FROZEN_EVAL_SPEC.md §7).
+
+    The authoritative number still comes from the `eval_loss_frozen` benchmark against
+    the saved adapter -- this is the curve, not the record. Nothing is caught here that
+    is not also caught there.
+
+    Everything that can be wrong about the *setup* is checked in `__init__`, before
+    training starts: a hash mismatch or a pooled lambda discovered 400 steps in would
+    take the run down with it.
+    """
+
+    def __init__(self, model, tokenizer, data_args, training_args, every_n_steps):
+        from frozen_eval import (
+            assert_matches,
+            build_dev_dataset,
+            load_frozen_set,
+            _assert_per_example_lambda,
+        )
+
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+        self.training_args = training_args
+        self.every_n_steps = int(every_n_steps)
+        self.record = load_frozen_set()
+        # Built once. Re-tokenising 250 questions on every firing would be wasted work,
+        # and re-deriving the dev split would be a second place for it to drift.
+        self.dataset = build_dev_dataset(tokenizer, data_args)
+        assert_matches(self.record, self.dataset, tokenizer, training_args.model_max_length)
+        _assert_per_example_lambda(model)
+
+    def on_step_end(self, args, state, control, model=None, **kwargs):
+        if self.every_n_steps <= 0 or state.global_step % self.every_n_steps != 0:
+            return
+        from frozen_eval import frozen_eval_loss
+
+        # `model` is the Trainer's unwrapped model, not the DDP wrapper: this is a
+        # forward-only pass under no_grad, so there is nothing for DDP to synchronise
+        # and the wrapper's unused-parameter bookkeeping is pure cost. Every rank runs
+        # it -- the gather inside is collective.
+        result = frozen_eval_loss(
+            model,
+            self.tokenizer,
+            self.data_args,
+            self.training_args,
+            dataset=self.dataset,
+            record=self.record,
+        )
+        if state.is_world_process_zero:
+            print(
+                f"step {state.global_step} | eval_loss_frozen: "
+                f"{result['eval_loss_frozen']:.6f}"
+            )
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "eval_loss_frozen": result["eval_loss_frozen"],
+                        **{
+                            f"eval_loss_frozen/t_{t:.4f}": loss
+                            for t, loss in zip(result["t_values"], result["per_t"])
+                        },
+                    },
+                    step=state.global_step,
+                )
 
 
 def _gather_by_index(local_indices, local_values, total, world_size, fill):
@@ -678,6 +962,60 @@ def build_args(config: Dict):
     return parser.parse_dict(filtered)
 
 
+# Per-adapter defaults for the shared hyperparameters on `ModelArguments`. These
+# are exactly the values `_build_peft_config` used to hardcode, so a config that
+# does not mention a field gets the behaviour it had before the field existed.
+#
+# `eta` and `fourier_m` are deliberately *not* given a single cross-method value:
+# the two noise-aware adapters were tuned at different strengths (NA-LoRTA at
+# 1.0, NaRA at its reference 0.1) and unifying them here would silently change
+# what a plain `tuning_type: nara` run means. Set them explicitly in the YAML to
+# hold them equal -- which is what the eta sweep and the eta=0 collapse do.
+ADAPTER_DEFAULTS = {
+    "lora": {"lora_dropout": 0.1},
+    "lorta": {"lora_dropout": 0.1},
+    "nalorta": {"lora_dropout": 0.1, "eta": 1.0, "fourier_m": 32},
+    "nara": {"lora_dropout": 0.05, "eta": 0.1, "fourier_m": 64},
+}
+
+
+def _resolve_adapter_settings(model_args):
+    """Resolve the shared adapter hyperparameters for this run's `tuning_type`.
+
+    Returns a dict of the settings that apply to this adapter. Fields left unset
+    in the config fall back to `ADAPTER_DEFAULTS`; fields that the selected
+    adapter has no use for (`eta`/`fourier_m` on lora/lorta) are dropped with a
+    warning rather than raising, so a sweep may list them across a mix of
+    adapters without every non-noise-aware cell erroring out.
+
+    The resolved values are written back onto `model_args` so that W&B records
+    what the run actually used rather than the `None` the config carried.
+    """
+    if model_args.tuning_type not in ADAPTER_DEFAULTS:
+        # 'none' (the benchmark-only baseline) and typos both land here. Neither
+        # has an adapter to configure; let `_build_peft_config` raise the error
+        # that actually says what to do about it.
+        return {}
+
+    defaults = ADAPTER_DEFAULTS[model_args.tuning_type]
+    resolved = {}
+    for name, default in defaults.items():
+        value = getattr(model_args, name, None)
+        resolved[name] = default if value is None else value
+
+    for name in ("eta", "fourier_m"):
+        if name not in defaults and getattr(model_args, name, None) is not None:
+            logging.warning(
+                f"`{name}` is set but tuning_type='{model_args.tuning_type}' has no "
+                f"noise-conditioning term to apply it to; ignoring it. Note that "
+                f"'{model_args.tuning_type}' is already the eta=0 case by construction."
+            )
+
+    for name, value in resolved.items():
+        setattr(model_args, name, value)
+    return resolved
+
+
 def _build_peft_config(model_args):
     """Return the adapter config for the selected `tuning_type`."""
     # LLaDA target modules: q_proj / k_proj / v_proj / attn_out (no o_proj).
@@ -690,6 +1028,8 @@ def _build_peft_config(model_args):
             "`batch_train.py --mode benchmark` / `--mode all` (both skip training "
             "for baseline runs)."
         )
+    settings = _resolve_adapter_settings(model_args)
+
     if model_args.tuning_type == "lora":
         from peft import LoraConfig
 
@@ -698,7 +1038,7 @@ def _build_peft_config(model_args):
             inference_mode=False,
             r=model_args.rank,
             lora_alpha=model_args.lora_alpha,
-            lora_dropout=0.1,
+            lora_dropout=settings["lora_dropout"],
             target_modules=llada_target_modules,
             init_lora_weights=True,
         )
@@ -709,7 +1049,7 @@ def _build_peft_config(model_args):
             r=model_args.rank,
             lora_alpha=model_args.lora_alpha,
             target_modules=llada_target_modules,
-            lora_dropout=0.1,
+            lora_dropout=settings["lora_dropout"],
             bias="none",
             task_type="CAUSAL_LM",
             init_lora_weights=True,
@@ -721,11 +1061,12 @@ def _build_peft_config(model_args):
             r=model_args.rank,
             lora_alpha=model_args.lora_alpha,
             target_modules=llada_target_modules,
-            lora_dropout=0.1,
+            lora_dropout=settings["lora_dropout"],
             bias="none",
             task_type="CAUSAL_LM",
             init_lora_weights=True,
-            embedding_length=32,
+            eta=settings["eta"],
+            embedding_length=settings["fourier_m"],
         )
     elif model_args.tuning_type == "nara":
         from peft import NARAConfig
@@ -740,15 +1081,15 @@ def _build_peft_config(model_args):
             r=model_args.rank,
             lora_alpha=model_args.lora_alpha,
             target_modules=llada_target_modules,
-            lora_dropout=0.05,
+            lora_dropout=settings["lora_dropout"],
             bias="none",
             task_type="CAUSAL_LM",
             init_lora_weights=True,
-            embedding_dim=64,
+            embedding_dim=settings["fourier_m"],
             embedding_type="fourier",
             fnn_hidden_size_1=256,
             fnn_hidden_size_2=512,
-            c_scale=0.1,
+            c_scale=settings["eta"],
             input_mode="nl",
         )
     raise ValueError(f"Unknown tuning_type: {model_args.tuning_type}")
@@ -782,6 +1123,22 @@ def run_training(config: Dict, output_dir: str):
     training_args.output_dir = output_dir
     is_main_process = training_args.process_index == 0
 
+    # Seed *here*, not implicitly via the Trainer. `Trainer.__init__` calls
+    # `set_seed(args.seed)`, but it is constructed further down -- after
+    # `get_peft_model` has already drawn `lora_A`, the `C_*` factors, `Theta` and
+    # the frozen Fourier `k`. Left to the Trainer, `seed` therefore controls data
+    # order only and the adapter's initialisation is not reproducible at all,
+    # which quietly makes a multi-seed comparison measure something other than
+    # seed variance. Seeding before the model is built covers both.
+    transformers.set_seed(training_args.seed)
+
+    # Resolve before `wandb.init` rather than leaving it to `_build_peft_config`
+    # below: the run's config snapshot is taken from `vars(model_args)`, and an
+    # unset field is still `None` at that point, so W&B would record `eta: None`
+    # for every run instead of the value the adapter was actually built with.
+    # Idempotent -- the resolved values are written back onto `model_args`.
+    _resolve_adapter_settings(model_args)
+
     if is_main_process:
         wandb.init(
             project=training_args.wandb_project,
@@ -814,9 +1171,20 @@ def run_training(config: Dict, output_dir: str):
     peft_config = _build_peft_config(model_args)
     model = get_peft_model(model, peft_config)
 
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"{name}: {param.shape} parameters")
+    # The parameter count is a *reported* number, not a diagnostic: the claim is joint
+    # on accuracy and parameters, so it is captured next to the adapter it describes
+    # rather than recomputed later from a config (which is how a rank or a target-module
+    # list quietly stops matching the table it is quoted in). See adapter_params.py.
+    param_summary = summarise_adapter_params(model)
+    for name, count in param_summary["breakdown"].items():
+        print(f"{name}: {count} parameters")
+    print(f"Trainable adapter parameters: {param_summary['adapter_params']}")
+    if is_main_process:
+        os.makedirs(training_args.output_dir, exist_ok=True)
+        with open(os.path.join(training_args.output_dir, "adapter_params.json"), "w") as f:
+            json.dump(param_summary, f, indent=2)
+        # Summary rather than a logged metric: it is one number per run, not a series.
+        wandb.run.summary["adapter_params"] = param_summary["adapter_params"]
 
     tokenizer = _load_tokenizer(model_args, training_args)
 
@@ -832,6 +1200,19 @@ def run_training(config: Dict, output_dir: str):
         diffusion_eps=training_args.diffusion_eps,
         **data_module,
     )
+
+    # Off unless a config asks for it, so nothing already written changes behaviour.
+    if training_args.eval_loss_frozen_steps:
+        trainer.add_callback(
+            FrozenEvalCallback(
+                model=model,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                training_args=training_args,
+                every_n_steps=training_args.eval_loss_frozen_steps,
+            )
+        )
+
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
@@ -868,8 +1249,18 @@ def run_training(config: Dict, output_dir: str):
 # only entry reuses `diffusion_evaluate` (GSM8K accuracy).
 
 
+def _benchmark_result_filename(bench_name: str) -> str:
+    """One file per benchmark, so dev and test accuracy stop overwriting each other.
+
+    `gsm8k_accuracy` keeps `benchmark.json`, with exactly the schema it already has:
+    per O5 no existing file or field changes meaning, and `write_summary` keeps emitting
+    the entries it emits today. Only the benchmarks added since get a suffixed name.
+    """
+    return "benchmark.json" if bench_name == "gsm8k_accuracy" else f"benchmark_{bench_name}.json"
+
+
 def _write_benchmark_result(output_dir: str, result: Dict):
-    path = os.path.join(output_dir, "benchmark.json")
+    path = os.path.join(output_dir, _benchmark_result_filename(result["benchmark"]))
     with open(path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"Wrote benchmark result -> {path}")
@@ -940,8 +1331,16 @@ def _assert_adapter_loaded(model, adapter_dir):
         )
 
 
-def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
-    """Load base model + trained adapter and score GSM8K test accuracy."""
+def _load_model_with_adapter(model_args, training_args, adapter_dir):
+    """Base model + the adapter under test, on this rank's GPU, in eval mode.
+
+    Shared by every benchmark. The `response_mask` check below matters more for
+    `eval_loss_frozen` than for accuracy: a silent fallback to a prompt+answer lambda
+    denominator would mis-condition the adapter and still return an entirely plausible
+    loss, whereas a wrong accuracy at least tends to look wrong.
+
+    Returns `(model, is_baseline)`.
+    """
     from peft import PeftModel
 
     is_baseline = model_args.tuning_type == NO_ADAPTER
@@ -958,7 +1357,13 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         # the base model *is* the thing being benchmarked here, not an accident.
         print(f"tuning_type='{NO_ADAPTER}': benchmarking the base model, no adapter")
     else:
-        model = PeftModel.from_pretrained(model, adapter_dir)
+        # `is_trainable=True` trains nothing -- every benchmark runs under `no_grad`
+        # with the model in eval mode. It is here because PEFT's default
+        # `inference_mode=True` clears `requires_grad` on the adapter, and
+        # `requires_grad` is the rule EXPERIMENT_DESIGN.md §3.2 counts parameters by
+        # (`adapter_params.py`). Without it `adapter_params` in every result file would
+        # be 0, which is a wrong number rather than a missing one.
+        model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
         # Checked on the CPU model, before the .to(device) below, so it is cheap.
         _assert_adapter_loaded(model, adapter_dir)
         # `generate()` only passes `response_mask` to a model that advertises it will
@@ -979,6 +1384,17 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
     # is pure inference, the ranks only talk to each other at the final gather.
     model = model.to(training_args.device)
     model.eval()
+    return model, is_baseline
+
+
+def _benchmark_adapter_params(model, is_baseline) -> int:
+    """`adapter_params` for a result file. Zero for the baseline, which has no adapter."""
+    return 0 if is_baseline else summarise_adapter_params(model)["adapter_params"]
+
+
+def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir):
+    """Load base model + trained adapter and score GSM8K test accuracy."""
+    model, is_baseline = _load_model_with_adapter(model_args, training_args, adapter_dir)
 
     tokenizer = _load_tokenizer(model_args, training_args)
     logging.warning("Downloading Data")
@@ -993,6 +1409,10 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
         "benchmark": "gsm8k_accuracy",
         "tuning_type": model_args.tuning_type,
         "accuracy": accuracy,
+        # An addition, not a change (O5): the claim is joint on accuracy and
+        # parameters, so the count travels with the accuracy it is quoted beside
+        # rather than being recomputed later from a config.
+        "adapter_params": _benchmark_adapter_params(model, is_baseline),
         "num_examples": len(answers),
         "predictions": ans_pred_list,
         "ground_truth": answers,
@@ -1006,9 +1426,44 @@ def _gsm8k_accuracy_benchmark(model_args, data_args, training_args, adapter_dir)
     }
 
 
+def _eval_loss_frozen_benchmark(model_args, data_args, training_args, adapter_dir):
+    """Tier 0's metric: the training objective on a committed set of (t, mask) pairs.
+
+    2000 forwards, so the model load costs more than the metric does -- Tier 0 configs
+    should set `sbatch_time: "01:00:00"` rather than inherit the 8 h default (O8).
+    """
+    from frozen_eval import frozen_eval_loss
+
+    model, is_baseline = _load_model_with_adapter(model_args, training_args, adapter_dir)
+    tokenizer = _load_tokenizer(model_args, training_args)
+
+    result = frozen_eval_loss(
+        model,
+        tokenizer,
+        data_args,
+        training_args,
+        # The bare base model's forward has no `response_mask` kwarg. This is the one
+        # call site that turns it off, and it is off because there is no adapter to
+        # condition -- not because the attribute happened to be missing.
+        pass_response_mask=not is_baseline,
+    )
+    label = "base model (no adapter)" if is_baseline else f"adapter: {adapter_dir}"
+    per_t = ", ".join(f"{t:.4f}:{loss:.4f}" for t, loss in zip(result["t_values"], result["per_t"]))
+    print(f"{label} | eval_loss_frozen: {result['eval_loss_frozen']:.6f}")
+    print(f"  per t bucket: {per_t}")
+    return {
+        "benchmark": "eval_loss_frozen",
+        "tuning_type": model_args.tuning_type,
+        "adapter_params": _benchmark_adapter_params(model, is_baseline),
+        "source": "benchmark",
+        **result,
+    }
+
+
 # Registry seam: name -> callable(model_args, data_args, training_args, adapter_dir).
 BENCHMARKS = {
     "gsm8k_accuracy": _gsm8k_accuracy_benchmark,
+    "eval_loss_frozen": _eval_loss_frozen_benchmark,
 }
 
 

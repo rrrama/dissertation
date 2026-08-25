@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Optional, Union
+from typing import Any, NamedTuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -26,6 +26,60 @@ from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
 from .config import LorTaConfig
+
+
+# Which axis of `dW` carries the attention heads.
+#
+# `dW` is `(out_features, in_features)` -- the forward (`result + x @ dW.T`) and the merge
+# (`nn.Linear.weight += dW`, and `nn.Linear.weight` is `(out, in)`) both say so. Which of
+# those two axes is the head-structured one is *not* the same for all four adapted matrices:
+#
+#     q_proj / k_proj / v_proj : (n_heads * head_dim, d_model)  -> heads on the OUTPUT
+#     attn_out / o_proj        : (d_model, n_heads * head_dim)  -> heads on the INPUT
+#
+# `C_h` indexes attention heads, so it has to multiply whichever axis that is. On LLaDA-8B
+# `d_model == n_heads * head_dim == 4096` and there is no GQA, so all four matrices are
+# square and the wrong choice is shape-correct and silent -- it just makes `C_h` index 32
+# arbitrary 128-wide slices of the residual stream. `_apply_delta` therefore checks the
+# factor shapes against the real base layer rather than trusting that everything is 4096.
+HEAD_AXIS_OUT = "out"
+HEAD_AXIS_IN = "in"
+
+
+class LorTaDelta(NamedTuple):
+    """The CP-factored weight delta for one adapted matrix.
+
+    Deliberately *not* materialised. The dense form is `n_layers * 4` matrices of
+    `(d_model, n_heads * head_dim)` rebuilt on every forward -- 8.6 GB of autograd graph
+    for LLaDA-8B -- while these factors carry the same information in `r`-sized pieces
+    and let `Linear.forward` do the whole update in rank space.
+
+    Attributes:
+        A: `(d_model, r)`, the residual-stream-side factor.
+        B: `(r, head_dim)`, the within-head factor.
+        coef: `(batch_or_1, n_heads, r)`, the per-head rank coefficients
+            `C_h[h] * C_m[m] * C_l[l]` (times the noise term, in NA-LoRTA). A leading
+            size-1 batch dimension broadcasts over the batch.
+        head_axis: `HEAD_AXIS_OUT` or `HEAD_AXIS_IN`, see above.
+    """
+
+    A: torch.Tensor
+    B: torch.Tensor
+    coef: torch.Tensor
+    head_axis: str
+
+    def to_dense(self) -> torch.Tensor:
+        """The explicit `(out_features, in_features)` delta, for merging only."""
+        if self.coef.shape[0] != 1:
+            raise ValueError(
+                f"Cannot materialise a delta with a per-example coefficient (batch {self.coef.shape[0]}): "
+                "there is no single weight matrix to fold into the base layer. Merge is only defined for "
+                "the batch-independent delta."
+            )
+        # p[o, (h, j)] = sum_k A[o, k] coef[h, k] B[k, j]; `A * coef[h]` scales A's columns,
+        # which is `A @ diag(coef[h])` without building the diagonal.
+        p = torch.cat([(self.A * self.coef[0, head_idx]) @ self.B for head_idx in range(self.coef.shape[1])], dim=1)
+        return p if self.head_axis == HEAD_AXIS_IN else p.T
 
 
 class LorTaLayer(LoraLayer):
@@ -130,13 +184,65 @@ class LorTaLayer(LoraLayer):
         weight_norm = torch.linalg.norm(weight, dim=1).to(weight.dtype)
         return weight_norm
 
+    def _apply_delta(self, x: torch.Tensor, delta: LorTaDelta) -> torch.Tensor:
+        """`x @ dW.T` for a CP-factored `dW`, without ever forming `dW`.
+
+        Two matmuls through rank space, which is both cheaper than the dense form it
+        replaces (`r`-wide intermediates instead of a `4096 x 4096` matrix per adapted
+        module per forward) and the only place the per-head factor has to be applied to
+        the right axis -- see `HEAD_AXIS_OUT` above. It also makes `coef` free to carry a
+        batch dimension, so per-example conditioning is an elementwise multiply rather
+        than a separate delta matrix per row.
+        """
+        A, B, coef, head_axis = delta
+        A = A.to(device=x.device, dtype=x.dtype)
+        B = B.to(device=x.device, dtype=x.dtype)
+        coef = coef.to(device=x.device, dtype=x.dtype)
+
+        n_heads, r = coef.shape[-2:]
+        head_dim = B.shape[1]
+        d_model = A.shape[0]
+
+        if x.dim() < 2:
+            raise ValueError(f"Expected an activation of at least 2 dimensions (batch, ..., features), got {x.shape}.")
+        if coef.shape[0] not in (1, x.shape[0]):
+            raise ValueError(
+                f"Per-example coefficients have batch size {coef.shape[0]} but the activations have "
+                f"{x.shape[0]}. This usually means the batch was reshaped between computing the "
+                "coefficients and reaching the layer."
+            )
+        # Broadcast over whatever dimensions (sequence, ...) the layer puts between batch and features.
+        coef = coef.reshape(coef.shape[0], *(1,) * (x.dim() - 2), n_heads, r)
+
+        if head_axis == HEAD_AXIS_OUT:
+            if (self.in_features, self.out_features) != (d_model, n_heads * head_dim):
+                raise ValueError(
+                    f"CP factors do not match the base layer: head-on-output expects "
+                    f"(in, out) == ({d_model}, {n_heads * head_dim}), but the layer is "
+                    f"({self.in_features}, {self.out_features})."
+                )
+            # out[..., h, j] = sum_k (x @ A)[..., k] * coef[..., h, k] * B[k, j]
+            h = (x @ A).unsqueeze(-2) * coef  # (..., n_heads, r)
+            return (h @ B).flatten(-2)  # (..., n_heads * head_dim)
+
+        if head_axis != HEAD_AXIS_IN:
+            raise ValueError(f"Unknown head axis {head_axis!r}; expected {HEAD_AXIS_OUT!r} or {HEAD_AXIS_IN!r}.")
+        if (self.in_features, self.out_features) != (n_heads * head_dim, d_model):
+            raise ValueError(
+                f"CP factors do not match the base layer: head-on-input expects "
+                f"(in, out) == ({n_heads * head_dim}, {d_model}), but the layer is "
+                f"({self.in_features}, {self.out_features})."
+            )
+        # out[..., o] = sum_k A[o, k] * sum_h coef[..., h, k] * sum_j x[..., h, j] * B[k, j]
+        h = x.unflatten(-1, (n_heads, head_dim)) @ B.T  # (..., n_heads, r)
+        return (h * coef).sum(-2) @ A.T  # (..., d_model)
+
     def _check_forward_args(self, x, *args, **kwargs):
         """Check if the arguments are compatible with the configs and state of the model"""
 
         # TODO: where to put this, after or bf the adapter_names check?
         # check that we receive the adapter weights from the parent class
-        dW = kwargs.get("adapter_weight", None)
-        if dW is None:
+        if kwargs.get("adapter_weight", None) is None:
             msg = "LoRTA receives adapter weights from the parent class."
             raise ValueError(msg)
 
@@ -337,8 +443,8 @@ class Linear(nn.Module, LorTaLayer):
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
         adapter_names = kwargs.pop("adapter_names", None)
-        dW = kwargs.pop("adapter_weight", None)
-        if dW is None:
+        delta = kwargs.pop("adapter_weight", None)
+        if delta is None:
             raise ValueError("LoRTA receives adapter weights from the parent class.")
         if self.disable_adapters:
             if self.merged:
@@ -357,10 +463,8 @@ class Linear(nn.Module, LorTaLayer):
 
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
-                x = x.to(dW.dtype)
-                dW = dW.to(x.device)
-                # TODO: check dW dimensions
-                result = result + dropout(x) @ dW.T * scaling
+                x = x.to(delta.A.dtype)
+                result = result + self._apply_delta(dropout(x), delta) * scaling
             result = result.to(torch_result_dtype)
 
         return result
@@ -522,20 +626,9 @@ class Embedding(nn.Module, LorTaLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
-            for active_adapter in self.active_adapters:
-                if active_adapter not in self.lora_embedding_A:
-                    continue
-                # embedding_A = self.lora_embedding_A[active_adapter].T
-                # embedding_B = self.lora_embedding_B[active_adapter].T
-                scaling = self.scaling[active_adapter]
-                dW = kwargs.get("adapter_weight", None)
-                if dW is None:
-                    raise ValueError("LoRTA receives adapter weights from the parent class.")
-                after_W = self._embed(x, dW)
-                result = result + (after_W) * scaling
-            result = result.to(torch_result_dtype)
+            # `adapter_weight` is a CP-factored `LorTaDelta` whose head axis is an
+            # attention-head axis; an embedding matrix has neither.
+            raise NotImplementedError("LoRTA does not support embedding layers.")
 
         return result
 
@@ -804,26 +897,9 @@ class Conv2d(nn.Module, LorTaLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
-
-            for active_adapter in self.active_adapters:
-                dW = kwargs.get("adapter_weight", None)
-                if dW is None:
-                    raise ValueError("LoRTA receives adapter weights from the parent class.")
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                x = x.to(dW.dtype)
-
-                if not self.use_dora[active_adapter]:
-                    result = (
-                        result
-                        + torch.nn.functional.conv2d(dropout(x), dW, padding=self.padding, stride=self.stride)
-                        * scaling
-                    )
-                else:
-                    raise NotImplementedError
-            result = result.to(torch_result_dtype)
+            # `adapter_weight` is a CP-factored `LorTaDelta`, shaped by attention heads
+            # and rank -- not a convolution kernel.
+            raise NotImplementedError("LoRTA does not support Conv2d layers.")
         return result
 
     def __repr__(self) -> str:
