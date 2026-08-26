@@ -43,15 +43,18 @@ learning_rate: 0.0001
 head_learning_rate: [0.00003, 0.0001, 0.0003]
 
 num_train_epochs: 2
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 10
+# 1 GPU, effective batch held at 60 (4 x 15 x 1). Free to repartition since O2 made
+# lambda per-example -- batch composition no longer changes the conditioning signal.
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 15
 gradient_checkpointing: false
 warmup_ratio: 0.03
 lr_scheduler_type: "cosine"
 seed: 42
 model_max_length: 512
 
-sbatch_time: "04:00:00"
+# ~8-9 h of training on 1 GPU (~3x the 3-GPU figure), and no resume_from_checkpoint.
+sbatch_time: "12:00:00"
 sbatch_time_benchmark: "01:00:00"
 
 expt_name: "tier0_headlr_matrix"
@@ -67,7 +70,8 @@ eval_loss_frozen_steps: 50
 mask_id: 126336
 diffusion_eps: 0.001
 
-nproc_per_node: 3
-gres: "gpu:lovelace_l40:3"
+# 1 GPU -- a 3-GPU allocation queues badly on this cluster. See tier0_lr.yaml.
+nproc_per_node: 1
+gres: "gpu:lovelace_l40:1"
 
 benchmark: "eval_loss_frozen"

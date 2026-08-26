@@ -41,21 +41,26 @@ data_name: "gsm8k"
 
 learning_rate: [0.0001, 0.0003, 0.001]
 # 1-2 epochs, per §7. ~7223 train examples after the dev carve-out at an effective batch
-# of 2 x 10 x 3 = 60 gives ~120 steps/epoch, so ~241 steps here. Note LR is therefore
+# of 4 x 15 x 1 = 60 gives ~120 steps/epoch, so ~241 steps here. Note LR is therefore
 # selected at a shortened budget while Tier 1 may run longer; that is standard, all arms
 # are shortened identically, and O7a records it as accepted residual risk.
 num_train_epochs: 2
-per_device_train_batch_size: 2
-gradient_accumulation_steps: 10
+# 1 GPU, effective batch held at 60 (4 x 15 x 1). Free to repartition since O2 made
+# lambda per-example -- batch composition no longer changes the conditioning signal.
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 15
 gradient_checkpointing: false
 warmup_ratio: 0.03
 lr_scheduler_type: "cosine"
 seed: 42
 model_max_length: 512
 
-# ~2-3 h of training. The benchmark is ~2000 forwards behind a model load -- minutes --
-# so it asks for its own budget rather than holding a training-sized reservation.
-sbatch_time: "04:00:00"
+# ~8-9 h of training on 1 GPU (~3x the 3-GPU figure; the job is compute-bound, and with
+# only ~138k trainable params there is no all-reduce overhead to recover). Nothing passes
+# resume_from_checkpoint, so a wall-clock kill loses the run -- hence the margin. The
+# benchmark is ~2000 forwards behind a model load -- minutes -- so it asks for its own
+# budget rather than holding a training-sized reservation.
+sbatch_time: "12:00:00"
 sbatch_time_benchmark: "01:00:00"
 
 expt_name: "tier0_lr"
@@ -75,8 +80,11 @@ eval_loss_frozen_steps: 50
 mask_id: 126336
 diffusion_eps: 0.001
 
-nproc_per_node: 3
-gres: "gpu:lovelace_l40:3"
+# 1 GPU: a 3-GPU allocation is a big enough ask on this cluster that the jobs sat in the
+# queue. ~3x the wall clock, but 6 single-GPU jobs schedule concurrently, so time to all
+# six is shorter. Estimated peak ~33 GB of 48 GB at batch 4 -- verify on the first run.
+nproc_per_node: 1
+gres: "gpu:lovelace_l40:1"
 
 # Tier 0's only metric. No generation -- decoding is 6 h and buys nothing for an LR
 # ranking (§6's evaluation tiers).
