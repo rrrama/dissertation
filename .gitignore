@@ -9,6 +9,11 @@ __pycache__/
 venv/
 .env
 
+# Per-instance storage roots, written by scripts/bootstrap.sh. Machine-specific by
+# definition. Note scripts/requirements.lock.txt is NOT ignored: the pinned
+# versions are part of the experimental record.
+.lorta.env
+
 # LLaDA experiment outputs
 llada/outputs/
 llada/outputs_*/

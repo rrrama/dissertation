@@ -121,6 +121,16 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
+    save_total_limit: Optional[int] = field(
+        default=2,
+        metadata={
+            "help": "Checkpoints to keep. Was unbounded, which was harmless when "
+            "nothing read checkpoints back; now that training resumes from them "
+            "(and several runs write to one volume concurrently) a 6-epoch run "
+            "would keep ~7 optimizer states for no reason. Two, so that a "
+            "checkpoint torn by a mid-write kill still leaves one to resume from."
+        },
+    )
     model_max_length: int = field(
         default=512,
         metadata={
@@ -1213,7 +1223,26 @@ def run_training(config: Dict, output_dir: str):
             )
         )
 
-    trainer.train()
+    # Resume if this run was interrupted. `save_strategy: steps` has always been
+    # writing `output_dir/checkpoint-N`; nothing ever read them back, so a killed
+    # run restarted from step 0. On a rented instance that can be reclaimed
+    # mid-run, that was the largest single risk in the migration off slurm
+    # (SLURM_MIGRATION.md §5).
+    #
+    # `get_last_checkpoint` returns None on a clean directory, so a fresh run is
+    # unaffected. A PEFT checkpoint carries optimizer, scheduler and RNG state
+    # alongside the adapter weights, so this restores the run rather than
+    # approximating it.
+    #
+    # Only reached when the run directory still has checkpoints: `--overwrite`
+    # deletes them precisely so that it retrains instead of resuming.
+    from transformers.trainer_utils import get_last_checkpoint
+
+    last_checkpoint = get_last_checkpoint(training_args.output_dir)
+    if last_checkpoint is not None:
+        print(f"Resuming from {last_checkpoint}")
+
+    trainer.train(resume_from_checkpoint=last_checkpoint)
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 

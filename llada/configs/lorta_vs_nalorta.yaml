@@ -44,7 +44,12 @@ gen_temperature: 0.0
 # one-at-a-time path); memory-bound, see BENCHMARK_PERF.md §4
 benchmark_batch_size: 8
 
-nproc_per_node: 3
-gres: "gpu:lovelace_l40:3"
+# One GPU per run, so the arms train and decode concurrently rather than queueing
+# behind each other. Was `3`, a fixed cluster allocation. Scaling within a run is
+# imperfect, so N runs at 1 GPU each finish no later than N runs serialised across
+# N GPUs -- and this way the two arms are also perfectly time-matched. Raise it
+# only if the box has more GPUs than this config has runs. `gres` was the slurm
+# side of the same request and no longer does anything (SLURM_MIGRATION.md §1.4).
+nproc_per_node: 1
 
 benchmark: "gsm8k_accuracy"

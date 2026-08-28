@@ -6,32 +6,38 @@ list-valued field is expanded into the cartesian product of runs -- `seed` is
 not special, it is just another hyperparameter that can be listed. For each
 point in the product this script:
 
-  1. creates ``outputs/<config_name>/<run>/``,
+  1. creates ``<OUTPUTS_ROOT>/<config_name>/<run>/``,
   2. writes a frozen, fully-resolved per-run ``config.yaml`` (no lists) and a
-     ``metadata.json`` (git hash, timestamp, dataset, versions),
-  3. generates one ``job.sbatch`` from a template based on
-     ``run_training.sbatch`` and submits it with ``sbatch`` (one job per run,
-     scheduled in parallel).
+     ``metadata.json`` (git hash, timestamp, dataset, versions, storage roots),
+  3. generates one ``job_<mode>.sh`` per phase and hands the lot to
+     ``local_runner``, which runs them across the box's GPUs and blocks until
+     they finish.
 
 Each per-run job runs ``torchrun train.py --config <frozen config.yaml>``
-(train mode) or ``python train.py --mode benchmark ...`` (benchmark mode).
+(train mode) or ``torchrun train.py --mode benchmark ...`` (benchmark mode).
 
-``--mode all`` submits both per run and chains them with a slurm dependency
-(``afterok``), so a sweep goes from config to benchmarked adapters without
-intervention: every run trains in parallel and each benchmark starts as soon as
-*its own* training exits 0.
+``--mode all`` gives each run *two phases in one GPU slot*: the benchmark starts
+only if that run's own training exits 0. That is what the slurm ``afterok``
+dependency used to do, so a sweep still goes from config to benchmarked adapters
+without intervention.
 
-Re-running a config in train mode is safe: runs that already have a saved
-adapter are skipped, so only the missing points of a sweep are submitted. Pass
-``--overwrite`` to retrain (and clobber) finished runs; that also deletes each
-resubmitted run's ``benchmark.json``, so ``summary.json`` shows it as pending
-rather than reporting the superseded adapter's accuracy for the ~20 h until the
-new result lands.
+**This blocks.** There is no queue to submit into any more -- run it under tmux::
+
+    tmux new -s tier0
+    python batch_train.py --mode all --config configs/tier0_lr.yaml
+
+Re-running a config is safe and is also how you recover from a dead supervisor:
+runs that already have a saved adapter are skipped, and a run killed mid-training
+resumes from its last checkpoint. Pass ``--overwrite`` to retrain (and clobber)
+finished runs; that also deletes each restarted run's ``benchmark*.json`` and
+``checkpoint-*`` directories, so ``summary.json`` reads as pending rather than
+reporting the superseded adapter's accuracy -- and so the retrain starts from
+scratch instead of silently resuming the run you asked to discard.
 
 ``tuning_type: none`` marks an untuned-baseline run: no adapter, nothing to
-train, benchmark only (train mode materialises its run directory and submits
-nothing; ``all``/``benchmark`` submit its benchmark with no dependency). Listing
-it alongside real adapters -- ``tuning_type: ["none", "nara"]`` -- puts the base
+train, benchmark only (train mode materialises its run directory and runs
+nothing; ``all``/``benchmark`` run its benchmark unconditionally). Listing it
+alongside real adapters -- ``tuning_type: ["none", "nara"]`` -- puts the base
 model's score in the same ``summary.json`` under identical decoding settings.
 
 Usage:
@@ -39,9 +45,11 @@ Usage:
     python batch_train.py --mode benchmark  --config configs/run001_baseline.yaml
     python batch_train.py --mode all        --config configs/run001_baseline.yaml
     python batch_train.py --mode summary    --config configs/run001_baseline.yaml
+    python batch_train.py --mode all --config ... --dry-run   # plan only
 
-This script only depends on PyYAML + the stdlib so it can run on a login node
-without importing torch/transformers.
+This script depends on PyYAML + the stdlib only; it never imports
+torch/transformers, so a config error surfaces in a second rather than after a
+model load. See SLURM_MIGRATION.md for the design.
 """
 
 import argparse
@@ -49,7 +57,6 @@ import glob
 import itertools
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -57,10 +64,14 @@ from datetime import datetime, timezone
 
 import yaml
 
-LLADA_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_DIR = os.path.dirname(LLADA_DIR)
-PEFT_DIR = os.path.join(REPO_DIR, "peft")
-OUTPUTS_ROOT = os.path.join(LLADA_DIR, "outputs")
+import local_runner
+import paths
+from local_runner import Job, Phase
+
+LLADA_DIR = paths.LLADA_DIR
+REPO_DIR = paths.REPO_ROOT
+PEFT_DIR = paths.PEFT_DIR
+OUTPUTS_ROOT = paths.OUTPUTS_ROOT
 
 # `tuning_type` value marking an untuned-baseline run: no adapter, benchmark
 # only. Kept in sync with train.py's NO_ADAPTER by hand rather than imported --
@@ -68,11 +79,16 @@ OUTPUTS_ROOT = os.path.join(LLADA_DIR, "outputs")
 # run on a login node.
 NO_ADAPTER = "none"
 
-# Keys that configure the batch/slurm layer rather than the training run. They
-# are still written into the frozen config (harmless -- train.py ignores keys it
-# does not recognise) but are consumed here for job generation.
-SLURM_META_KEYS = {
-    "nproc_per_node",
+# Keys that meant something to slurm and mean nothing now. They are left in the
+# configs on purpose: those files are the experimental record, and deleting the
+# keys would be a diff across every one of them for no behavioural gain. They are
+# still written into the frozen config (harmless -- train.py ignores keys it does
+# not recognise) and reported once per invocation so nobody tunes a dead knob.
+#
+# `nproc_per_node` is NOT here: it survives, and now means "GPUs this run holds
+# out of the box's pool" rather than a request to a scheduler with a whole cluster
+# behind it. See _run_settings.
+RETIRED_KEYS = {
     "gres",
     "partition",
     "cpus_per_task",
@@ -101,31 +117,48 @@ NAME_ABBREV = {
     "fourier_m": "m",
 }
 
-SBATCH_TEMPLATE = """#!/bin/bash
+JOB_TEMPLATE = """#!/bin/bash
 #
-#SBATCH --job-name={job_name}
-#SBATCH --partition={partition}
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task={cpus_per_task}
-#SBATCH --gres={gres}
-#SBATCH --time={sbatch_time}
-#SBATCH --mem={sbatch_mem}
-#SBATCH --output={log_dir}/slurm-%j.out
-#SBATCH --error={log_dir}/slurm-%j.err
+# {job_name}
+#
+# Generated by batch_train.py -- do not edit; re-running batch_train.py rewrites
+# it. Runnable by hand exactly as the supervisor runs it:
+#
+#     bash {script_name}                      # uses the defaults below
+#     CUDA_VISIBLE_DEVICES=1 bash {script_name}
+#
+# local_runner overrides CUDA_VISIBLE_DEVICES, LORTA_RDZV_PORT and
+# OMP_NUM_THREADS at dispatch; everything else is baked in here so this file is a
+# faithful record of the run.
+set -euo pipefail
 
-source /etc/profile.d/modules.sh
-source $SHARE/u5751903/lorta_venv/bin/activate
+export CUDA_VISIBLE_DEVICES="${{CUDA_VISIBLE_DEVICES:-{default_devices}}}"
+export LORTA_RDZV_PORT="${{LORTA_RDZV_PORT:-29500}}"
+export OMP_NUM_THREADS="${{OMP_NUM_THREADS:-1}}"
 
-export HF_HOME=$SHARE/u5751903/models/
-export WANDB_MODE=offline
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Storage roots, venv, HF_HOME, WANDB_MODE. `set +u` because some venv activate
+# scripts touch $PS1 unguarded, which is fatal under `set -u`.
+set +u
+source {repo_dir}/scripts/env.sh
+set -u
 
-# Installed explicitly because the peft install below is --no-deps.
-pip install wandb pyyaml
-pip install -e {peft_dir} --no-deps
-
+# `llada/`, not the repo root: the root holds a legacy gsm8k/ directory and
+# datasets.load_dataset resolves local paths before the hub, so from there this
+# dies with "No (supported) data files found in gsm8k".
 cd {llada_dir}
-srun {run_cmd}
+
+# Not `--standalone`: it picks the c10d rendezvous endpoint itself, and which port
+# depends on the torch version -- older releases pin 29400, which two concurrent
+# jobs on one box collide over. One job per node made that unreachable under
+# slurm. Asking for c10d explicitly on a port local_runner probed is equivalent
+# and version-independent.
+exec torchrun \\
+    --nnodes=1 \\
+    --nproc_per_node={nproc_per_node} \\
+    --rdzv-backend=c10d \\
+    --rdzv-endpoint=localhost:"$LORTA_RDZV_PORT" \\
+    --rdzv-id={rdzv_id} \\
+    train.py {mode_flag}--config {config_path} --output_dir {run_dir}
 """
 
 
@@ -204,6 +237,23 @@ def _git_hash():
 
 
 def _versions():
+    """Library versions, read from the bootstrap marker.
+
+    Read from `.lorta-bootstrap.json` rather than by importing torch here: this
+    module's whole reason for staying import-light is that a config error should
+    surface in a second, not after a multi-second CUDA import. The marker is
+    written by scripts/bootstrap.sh from the venv every job actually runs in, so
+    it is the same answer -- and unlike the old login-node import, it is not
+    `null` for everything. Falls back to importing if the marker is missing.
+    """
+    try:
+        with open(paths.BOOTSTRAP_MARKER) as f:
+            recorded = json.load(f).get("versions")
+        if recorded:
+            return recorded
+    except (OSError, json.JSONDecodeError):
+        pass
+
     versions = {}
     for module in ("torch", "transformers", "peft", "datasets"):
         try:
@@ -224,6 +274,9 @@ def build_metadata(run_cfg, varying):
         "versions": _versions(),
         "varying": varying,
         "python": sys.version.split()[0],
+        # Which disks this run used. A result that cannot be found later is
+        # usually a root that resolved differently than assumed.
+        "roots": paths.describe(),
     }
 
 
@@ -232,107 +285,81 @@ def build_metadata(run_cfg, varying):
 # --------------------------------------------------------------------------- #
 
 
-def _slurm_settings(run_cfg, mode):
-    """Resolve slurm/GPU settings from the config, with plan defaults."""
-    nproc = int(run_cfg.get("nproc_per_node", 3))
-    gres = run_cfg.get("gres")
-    if gres is None:
-        gres = f"gpu:lovelace_l40:{nproc}"
-    # Benchmark sampling cannot be split within a question, but it is embarrassingly
-    # parallel *across* questions: each rank samples its own shard of the GSM8K test
-    # set (see diffusion_evaluate), so benchmarks use the same GPU count as training.
-    #
-    # Measured on this cluster (3x L40, the defaults above): a 6-epoch training run
-    # takes ~8 h and a full 1319-question benchmark decode ~6 h. The 8 h default below
-    # therefore fits a benchmark with ~2 h of margin and fits the short Tier 0 runs
-    # (1-2 epochs, ~2-3 h) several times over -- asking for 12 h bought nothing and
-    # cost queue priority on every job.
-    #
-    # `sbatch_time` covers both modes unless `sbatch_time_benchmark` overrides the
-    # benchmark job. That override exists for Tier 0, where the two are wildly
-    # asymmetric: training is a couple of hours but `eval_loss_frozen` is ~2000
-    # forwards behind a model load, i.e. minutes. Asking for the training budget on
-    # twelve short benchmark jobs costs queue priority and buys nothing. Benchmarks
-    # that *decode* (gsm8k_accuracy, ~6 h) must not set it.
-    #
-    # !! A *6-epoch* training run measured ~8 h, i.e. exactly this budget with no
-    # margin, and nothing passes `resume_from_checkpoint`, so a wall-clock kill loses
-    # the run rather than resuming it. Tier 1 configs (full training) must set
-    # `sbatch_time` explicitly -- 12:00:00 is the value they inherited before this
-    # default changed. The O1/O2 CP-factored delta should have made the forward
-    # cheaper, but that has not been timed; do not assume it bought headroom.
-    return {
-        "nproc_per_node": nproc,
-        "gres": gres,
-        "partition": run_cfg.get("partition", "gpu"),
-        "cpus_per_task": run_cfg.get("cpus_per_task", 3),
-        "sbatch_time": (
-            run_cfg.get("sbatch_time_benchmark")
-            if mode == "benchmark" and run_cfg.get("sbatch_time_benchmark")
-            else run_cfg.get("sbatch_time", "08:00:00")
-        ),
-        "sbatch_mem": run_cfg.get("sbatch_mem", "120G"),
-    }
+def _run_settings(run_cfg, n_available=None):
+    """Resolve how many GPUs this run holds.
 
+    `nproc_per_node` used to be a request to a scheduler with a cluster behind it;
+    it is now a claim on a pool of 2-4 devices, so the default drops from 3 to 1
+    and `local_runner.preflight` refuses a config asking for more than exist
+    rather than leaving it unschedulable forever.
 
-def _run_command(mode, config_path, run_dir, slurm):
-    mode_flag = "" if mode == "train" else "--mode benchmark "
-    return (
-        f"torchrun --standalone --nproc_per_node={slurm['nproc_per_node']} "
-        f"train.py {mode_flag}--config {config_path} --output_dir {run_dir}"
-    )
+    ``nproc_per_node: all`` means every GPU in the pool. That is the right setting
+    for a config that expands to a *single* run -- `baseline.yaml` -- where there
+    is nothing to run alongside it and splitting the decode across all devices is
+    pure speedup. It is the wrong setting for a sweep with more runs than GPUs:
+    scaling within a run is imperfect, so N runs at 1 GPU each finish no later
+    than N runs serialised across N GPUs, and usually sooner. It also keeps these
+    configs from hardcoding a device count the next box will not have.
 
+    Benchmark sampling cannot be split within a question, but it is embarrassingly
+    parallel *across* questions: each rank samples its own shard of the GSM8K test
+    set (see diffusion_evaluate), so benchmarks use the same GPU count as training.
 
-def write_sbatch(mode, run_cfg, config_name, name, config_path, run_dir, log_dir):
-    slurm = _slurm_settings(run_cfg, mode)
-    job_name = run_cfg.get("job_name") or f"{config_name}-{name}-{mode}"
-    script = SBATCH_TEMPLATE.format(
-        job_name=job_name,
-        partition=slurm["partition"],
-        cpus_per_task=slurm["cpus_per_task"],
-        gres=slurm["gres"],
-        sbatch_time=slurm["sbatch_time"],
-        sbatch_mem=slurm["sbatch_mem"],
-        log_dir=log_dir,
-        llada_dir=LLADA_DIR,
-        peft_dir=PEFT_DIR,
-        run_cmd=_run_command(mode, config_path, run_dir, slurm),
-    )
-    sbatch_path = os.path.join(run_dir, f"job_{mode}.sbatch")
-    with open(sbatch_path, "w") as f:
-        f.write(script)
-    return sbatch_path
-
-
-def submit(sbatch_path, no_submit, after_job=None):
-    """Submit a job, optionally gated on another job finishing successfully.
-
-    Returns the slurm job id (as a string) so callers can chain dependencies,
-    or None if nothing was submitted.
-
-    ``after_job`` adds ``--dependency=afterok:<id>``: the job stays queued until
-    the dependency exits 0, and ``--kill-on-invalid-dep`` cancels it outright if
-    the dependency fails, rather than leaving it pending forever.
+    There is no wall-clock budget any more, which retires `sbatch_time` and the
+    whole class of failure where a 6-epoch run was killed at exactly its 8 h
+    reservation. Training that overruns now simply keeps running, and a run that
+    dies for any other reason resumes from its last checkpoint.
     """
-    cmd = ["sbatch"]
-    if after_job:
-        cmd += [f"--dependency=afterok:{after_job}", "--kill-on-invalid-dep=yes"]
-    cmd.append(sbatch_path)
+    requested = run_cfg.get("nproc_per_node", 1)
+    if isinstance(requested, str) and requested.strip().lower() == "all":
+        if n_available is None:
+            n_available = len(local_runner.visible_devices())
+        # `or 1` so that a dry run on a machine with no GPUs still writes a
+        # readable plan instead of dividing the world by zero.
+        return {"nproc_per_node": n_available or 1}
+    return {"nproc_per_node": int(requested)}
 
-    if no_submit:
-        print(f"  [no-submit] would run: {' '.join(cmd)}")
-        return None
-    if shutil.which("sbatch") is None:
-        print(f"  [warn] sbatch not found; skipping submit of {sbatch_path}")
-        return None
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  [error] sbatch failed: {result.stderr.strip()}")
-        return None
-    job_line = result.stdout.strip()
-    print(f"  submitted: {job_line}")
-    match = re.search(r"(\d+)", job_line)
-    return match.group(1) if match else None
+
+def write_job_script(
+    mode, run_cfg, config_name, name, config_path, run_dir, log_dir, n_available=None
+):
+    """Write the per-run launch script for one phase. Returns its path.
+
+    Same role, signature and call sites as the old `write_sbatch`; the artifact
+    just moved from `job_<mode>.sbatch` to `job_<mode>.sh`.
+    """
+    settings = _run_settings(run_cfg, n_available)
+    job_name = run_cfg.get("job_name") or f"{config_name}-{name}-{mode}"
+    script_name = f"job_{mode}.sh"
+    script = JOB_TEMPLATE.format(
+        job_name=job_name,
+        script_name=script_name,
+        # Only a fallback for running this script by hand; local_runner passes the
+        # devices it actually allocated.
+        default_devices=",".join(str(i) for i in range(settings["nproc_per_node"])),
+        nproc_per_node=settings["nproc_per_node"],
+        rdzv_id=f"{config_name}-{name}-{mode}",
+        repo_dir=REPO_DIR,
+        llada_dir=LLADA_DIR,
+        mode_flag="" if mode == "train" else "--mode benchmark ",
+        config_path=config_path,
+        run_dir=run_dir,
+    )
+    script_path = os.path.join(run_dir, script_name)
+    with open(script_path, "w") as f:
+        f.write(script)
+    os.chmod(script_path, 0o755)
+    return script_path
+
+
+def _report_retired_keys(config):
+    """Say once that the slurm knobs in this config no longer do anything."""
+    present = sorted(RETIRED_KEYS & set(config))
+    if present:
+        print(
+            f"[note] ignoring retired slurm key(s): {', '.join(present)} "
+            f"(no scheduler any more; see SLURM_MIGRATION.md §1.4)"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -379,25 +406,31 @@ BENCHMARK_SUMMARY_FIELDS = {
 }
 
 
-def _clear_stale_results(run_dir, no_submit):
-    """Drop a previous run's benchmark results, which `--overwrite` has invalidated.
+def _clear_stale_results(run_dir, dry_run):
+    """Drop what `--overwrite` has invalidated: benchmark results and checkpoints.
 
-    train.py only rewrites that file when a benchmark *finishes*, which is ~20 h
-    after the training job it depends on. Until then the old result sits next to
-    an adapter that is being replaced, and `write_summary` reports it as
-    `status: done` with the previous accuracy -- indefinitely, if the resubmitted
-    job never lands. Removing it up front makes the run read as `pending`, which
-    is what it is.
+    **Benchmark results.** train.py only rewrites those when a benchmark
+    *finishes*, hours after the training it depends on. Until then the old result
+    sits next to an adapter that is being replaced, and `write_summary` reports it
+    as `status: done` with the previous accuracy -- indefinitely, if the rerun
+    never lands. Removing it up front makes the run read as `pending`.
+
+    **Checkpoints.** train.py now resumes from `checkpoint-*` when one is present
+    (SLURM_MIGRATION.md §5). Leaving them behind would make `--overwrite` silently
+    *resume* the run it was asked to discard -- the exact thing the flag exists to
+    prevent, and invisible in the results afterwards. They must go in the same pass.
 
     Not called without `--overwrite`: that is the flag that says the run's outputs
-    are expendable. A dry run (`--no-submit`) only says what it would remove.
+    are expendable. A dry run only says what it would remove.
     """
-    for bench_path in _benchmark_result_files(run_dir):
-        rel = os.path.relpath(bench_path, LLADA_DIR)
-        if no_submit:
+    stale = _benchmark_result_files(run_dir)
+    stale += sorted(glob.glob(os.path.join(run_dir, "checkpoint-*")))
+    for path in stale:
+        rel = paths.short(path)
+        if dry_run:
             print(f"  [overwrite] would remove stale {rel}")
             continue
-        os.remove(bench_path)
+        shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
         print(f"  [overwrite] removed stale {rel}")
 
 
@@ -437,7 +470,7 @@ def write_summary(exp_dir, runs_info, mode):
     for info in runs_info:
         entry = {
             "run": info["name"],
-            "run_dir": os.path.relpath(info["run_dir"], LLADA_DIR),
+            "run_dir": paths.short(info["run_dir"]),
             "varying": info["varying"],
         }
         result_files = _benchmark_result_files(info["run_dir"])
@@ -468,14 +501,16 @@ def write_summary(exp_dir, runs_info, mode):
     print(f"Wrote {summary_path}")
 
 
-def run_train_mode(config, config_name, no_submit, overwrite):
+def run_train_mode(config, config_name, dry_run, overwrite, queue_opts):
     runs = expand_runs(config)
     names = _unique_names(runs)
     exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
     os.makedirs(exp_dir, exist_ok=True)
 
     print(f"Expanded to {len(runs)} run(s) under {exp_dir}")
+    n_available = len(queue_opts["devices"])
     runs_info = []
+    jobs = []
     skipped = []
     baselines = []
     for idx, ((run_cfg, varying), name) in enumerate(zip(runs, names)):
@@ -502,11 +537,19 @@ def run_train_mode(config, config_name, no_submit, overwrite):
         print(f"[{idx + 1}/{len(runs)}] {name}")
         if overwrite:
             # The adapter this result was measured on is about to be replaced.
-            _clear_stale_results(run_dir, no_submit)
-        sbatch_path = write_sbatch(
-            "train", run_cfg, config_name, name, config_path, run_dir, log_dir
+            _clear_stale_results(run_dir, dry_run)
+        script = write_job_script(
+            "train", run_cfg, config_name, name, config_path, run_dir, log_dir,
+            n_available,
         )
-        submit(sbatch_path, no_submit)
+        jobs.append(
+            Job(
+                name=name,
+                run_dir=run_dir,
+                phases=[Phase("train", script)],
+                n_gpus=_run_settings(run_cfg, n_available)["nproc_per_node"],
+            )
+        )
         runs_info.append({"name": name, "run_dir": run_dir, "varying": varying})
 
     if skipped:
@@ -521,15 +564,17 @@ def run_train_mode(config, config_name, no_submit, overwrite):
             f"--mode benchmark: {', '.join(baselines)}"
         )
 
+    results = local_runner.run_queue(jobs, dry_run=dry_run, **queue_opts)
     write_summary(exp_dir, runs_info, "train")
+    return results
 
 
-def run_all_mode(config, config_name, no_submit, overwrite):
-    """Submit train + benchmark for every run, chained by a slurm dependency.
+def run_all_mode(config, config_name, dry_run, overwrite, queue_opts):
+    """Run train + benchmark for every run, chained within one GPU slot.
 
     Unlike `--mode benchmark`, this does not require an adapter to exist on disk
-    yet: the `afterok` dependency is what gates the benchmark, so a fresh sweep
-    goes from config to results in one command.
+    yet: the benchmark phase is gated on its own training exiting 0, so a fresh
+    sweep goes from config to results in one command.
     """
     runs = expand_runs(config)
     names = _unique_names(runs)
@@ -537,55 +582,69 @@ def run_all_mode(config, config_name, no_submit, overwrite):
     os.makedirs(exp_dir, exist_ok=True)
 
     print(f"Expanded to {len(runs)} run(s) under {exp_dir}")
+    n_available = len(queue_opts["devices"])
     runs_info = []
+    jobs = []
     reused = []
     for idx, ((run_cfg, varying), name) in enumerate(zip(runs, names)):
         run_dir = os.path.join(exp_dir, name)
         info = {"name": name, "run_dir": run_dir, "varying": varying}
         print(f"[{idx + 1}/{len(runs)}] {name}")
 
+        phases = []
         if _is_baseline(run_cfg):
-            # No adapter to train, so the benchmark is unconditional -- no
-            # dependency, and `--overwrite` has nothing to redo.
+            # No adapter to train, so the benchmark is unconditional -- nothing to
+            # gate it on, and `--overwrite` has nothing to redo.
             print(f"  [baseline] tuning_type: {NO_ADAPTER}; benchmarking base model")
             run_dir, log_dir, config_path = _materialise_run(
                 exp_dir, name, run_cfg, varying
             )
-            train_job = None
         elif _is_trained(run_dir) and not overwrite:
-            # Adapter already on disk: nothing to train, so the benchmark goes
-            # straight onto the queue with no dependency.
+            # Adapter already on disk: nothing to train, so the run is a benchmark
+            # phase on its own.
             reused.append(name)
             log_dir = os.path.join(run_dir, "logs")
             os.makedirs(log_dir, exist_ok=True)
             config_path = os.path.join(run_dir, "config.yaml")
-            train_job = None
         else:
             run_dir, log_dir, config_path = _materialise_run(
                 exp_dir, name, run_cfg, varying
             )
-            train_sbatch = write_sbatch(
-                "train", run_cfg, config_name, name, config_path, run_dir, log_dir
+            phases.append(
+                Phase(
+                    "train",
+                    write_job_script(
+                        "train", run_cfg, config_name, name, config_path, run_dir,
+                        log_dir, n_available,
+                    ),
+                )
             )
-            train_job = submit(train_sbatch, no_submit)
-            if no_submit:
-                # Keep the dry run readable: show the dependency that a real
-                # submit would attach.
-                train_job = "<train_job_id>"
-            elif train_job is None:
-                print("  [error] train job not submitted; skipping its benchmark")
-                runs_info.append(info)
-                continue
 
         if overwrite:
             # Reachable from the baseline branch (its benchmark is unconditional)
             # and from the retrain branch; the "reused" branch above is entered
             # only when `overwrite` is false, so a kept adapter keeps its result.
-            _clear_stale_results(run_dir, no_submit)
-        bench_sbatch = write_sbatch(
-            "benchmark", run_cfg, config_name, name, config_path, run_dir, log_dir
+            _clear_stale_results(run_dir, dry_run)
+
+        # Appended after the train phase, so local_runner runs it only if training
+        # exits 0 -- the `afterok` dependency, minus the scheduler.
+        phases.append(
+            Phase(
+                "benchmark",
+                write_job_script(
+                    "benchmark", run_cfg, config_name, name, config_path, run_dir,
+                    log_dir, n_available,
+                ),
+            )
         )
-        submit(bench_sbatch, no_submit, after_job=train_job)
+        jobs.append(
+            Job(
+                name=name,
+                run_dir=run_dir,
+                phases=phases,
+                n_gpus=_run_settings(run_cfg, n_available)["nproc_per_node"],
+            )
+        )
         runs_info.append(info)
 
     if reused:
@@ -595,11 +654,13 @@ def run_all_mode(config, config_name, no_submit, overwrite):
             f"{', '.join(reused)}"
         )
 
+    results = local_runner.run_queue(jobs, dry_run=dry_run, **queue_opts)
     write_summary(exp_dir, runs_info, "all")
+    return results
 
 
 def run_summary_mode(config, config_name):
-    """Refresh summary.json from whatever results are on disk. Submits nothing."""
+    """Refresh summary.json from whatever results are on disk. Runs nothing."""
     runs = expand_runs(config)
     names = _unique_names(runs)
     exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
@@ -613,13 +674,15 @@ def run_summary_mode(config, config_name):
     write_summary(exp_dir, runs_info, "summary")
 
 
-def run_benchmark_mode(config, config_name, no_submit):
+def run_benchmark_mode(config, config_name, dry_run, queue_opts):
     runs = expand_runs(config)
     names = _unique_names(runs)
     exp_dir = os.path.join(OUTPUTS_ROOT, config_name)
 
     # Check all runs exist / are trained before launching anything.
+    n_available = len(queue_opts["devices"])
     runs_info = []
+    jobs = []
     missing = []
     for (run_cfg, varying), name in zip(runs, names):
         run_dir = os.path.join(exp_dir, name)
@@ -660,7 +723,7 @@ def run_benchmark_mode(config, config_name, no_submit):
             log_dir = os.path.join(run_dir, "logs")
             os.makedirs(log_dir, exist_ok=True)
             config_path = os.path.join(run_dir, "config.yaml")
-        sbatch_path = write_sbatch(
+        script = write_job_script(
             "benchmark",
             info["run_cfg"],
             config_name,
@@ -668,40 +731,86 @@ def run_benchmark_mode(config, config_name, no_submit):
             config_path,
             run_dir,
             log_dir,
+            n_available,
         )
-        submit(sbatch_path, no_submit)
+        jobs.append(
+            Job(
+                name=info["name"],
+                run_dir=run_dir,
+                phases=[Phase("benchmark", script)],
+                n_gpus=_run_settings(info["run_cfg"], n_available)["nproc_per_node"],
+            )
+        )
 
-    # Refresh the aggregate; benchmark.json files appear as jobs finish, so
-    # re-running this mode later picks up completed results.
+    results = local_runner.run_queue(jobs, dry_run=dry_run, **queue_opts)
+    # Refresh the aggregate; benchmark*.json files appear as jobs finish, and the
+    # queue has drained by the time we get here, so this picks up everything that
+    # landed in this invocation.
     write_summary(exp_dir, runs_info, "benchmark")
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--mode",
         choices=["train", "benchmark", "all", "summary"],
         default="train",
         help=(
-            "train/benchmark submit one job per run; 'all' submits both and "
-            "chains the benchmark behind training with a slurm dependency; "
-            "'summary' only refreshes summary.json from results on disk."
+            "train/benchmark run one job per run; 'all' runs both, with each "
+            "benchmark gated on its own training exiting 0; 'summary' only "
+            "refreshes summary.json from results on disk."
         ),
     )
     parser.add_argument("--config", required=True, help="Experiment YAML config.")
     parser.add_argument(
+        "--dry-run",
         "--no-submit",
+        dest="dry_run",
         action="store_true",
-        help="Generate run dirs / sbatch scripts but do not call sbatch.",
+        help=(
+            "Materialise run dirs and job scripts, print the dispatch plan, but "
+            "launch nothing. `--no-submit` is the old name and still works."
+        ),
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help=(
             "Retrain runs that already have a saved adapter, overwriting them, "
-            "and delete the benchmark.json of every run resubmitted this way. "
-            "By default such runs are skipped, so re-running a config resumes "
-            "an incomplete sweep instead of clobbering finished LoRTAs."
+            "and delete the benchmark*.json and checkpoint-* of every run "
+            "restarted this way (without which the retrain would resume the run "
+            "it was asked to discard). By default such runs are skipped, so "
+            "re-running a config resumes an incomplete sweep instead of "
+            "clobbering finished LoRTAs."
+        ),
+    )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help=(
+            "Comma-separated GPU ids to schedule onto, e.g. '0,2'. Defaults to "
+            "every visible device (CUDA_VISIBLE_DEVICES, else all of them)."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        help=(
+            "Cap on simultaneously running jobs. Defaults to GPU-limited. Lower it "
+            "if host RAM, not GPU memory, is the binding constraint."
+        ),
+    )
+    parser.add_argument(
+        "--stagger",
+        type=float,
+        default=local_runner.DEFAULT_STAGGER_SECONDS,
+        help=(
+            "Seconds to leave between launches, so that concurrent 8B model loads "
+            "do not spike host RAM together. 0 disables."
         ),
     )
     args = parser.parse_args()
@@ -710,15 +819,39 @@ def main():
         config = yaml.safe_load(f) or {}
     config_name = os.path.splitext(os.path.basename(args.config))[0]
 
-    if args.mode == "train":
-        run_train_mode(config, config_name, args.no_submit, args.overwrite)
-    elif args.mode == "all":
-        run_all_mode(config, config_name, args.no_submit, args.overwrite)
-    elif args.mode == "summary":
+    print(paths.format_description())
+    _report_retired_keys(config)
+
+    # Resolved concretely here rather than inside run_queue, because
+    # `nproc_per_node: all` has to mean "all of the pool this invocation is using",
+    # which `--gpus` can narrow.
+    devices = (
+        [d.strip() for d in args.gpus.split(",") if d.strip()]
+        if args.gpus
+        else local_runner.visible_devices()
+    )
+    queue_opts = {
+        "devices": devices,
+        "max_concurrent": args.max_concurrent,
+        "stagger_seconds": args.stagger,
+    }
+
+    if args.mode == "summary":
         run_summary_mode(config, config_name)
+        return 0
+
+    runner = {
+        "train": run_train_mode,
+        "all": run_all_mode,
+    }.get(args.mode)
+    if runner is not None:
+        results = runner(config, config_name, args.dry_run, args.overwrite, queue_opts)
     else:
-        run_benchmark_mode(config, config_name, args.no_submit)
+        results = run_benchmark_mode(config, config_name, args.dry_run, queue_opts)
+
+    # Non-zero if any run failed, so a wrapper script or `&&` chain can tell.
+    return local_runner.exit_code(results)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

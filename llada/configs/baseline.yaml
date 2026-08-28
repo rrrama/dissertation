@@ -40,7 +40,11 @@ remasking: "low_confidence"
 gen_temperature: 0.0
 benchmark_batch_size: 8
 
-nproc_per_node: 3
-gres: "gpu:lovelace_l40:3"
+# Every GPU on the box. This config expands to a single run, so there is nothing
+# to schedule alongside it and the decode shards cleanly across ranks (each rank
+# takes its own slice of the test set). Was `3`, a fixed cluster allocation; `all`
+# does not need to know what hardware it is on. `gres` was the slurm side of the
+# same request and no longer does anything -- see SLURM_MIGRATION.md §1.4.
+nproc_per_node: all
 
 benchmark: "gsm8k_accuracy"
